@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Source PDFs are large (the A&P 2e book is ~455 MB) — never commit them.
+*.pdf
+
+# Rendered page images are uploaded to the Hugging Face dataset, not Git.
+data/corpus/pages/
+
+# The index files ARE committed (they bundle into the Vercel function):
+#   data/corpus/index.npy
+#   data/corpus/manifest.json
+
+# Node / Next.js (web/)
+node_modules/
+.next/
+out/
+.vercel/
+
+# Env / secrets
+.env
+.env.local
+*.local
+
+# OS
+.DS_Store
