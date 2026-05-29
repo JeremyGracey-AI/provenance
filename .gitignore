@@ -33,3 +33,4 @@ out/
 
 # Local tooling config (Claude Code launch/preview + local settings)
 .claude/
+.vercel
