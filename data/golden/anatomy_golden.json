@@ -1,0 +1,46 @@
+[
+  {
+    "question": "What are the four primary tissue types in the human body?",
+    "gold_pages": ["anatomy-physiology-2e#p146", "anatomy-physiology-2e#p177"]
+  },
+  {
+    "question": "Describe the sliding filament model of muscle contraction.",
+    "gold_pages": ["anatomy-physiology-2e#p394", "anatomy-physiology-2e#p395"]
+  },
+  {
+    "question": "What is the function of the loop of Henle in the nephron?",
+    "gold_pages": ["anatomy-physiology-2e#p1168", "anatomy-physiology-2e#p1172"]
+  },
+  {
+    "question": "Which bones form the orbit of the eye?",
+    "gold_pages": ["anatomy-physiology-2e#p268"]
+  },
+  {
+    "question": "What are the layers of the epidermis from deep to superficial?",
+    "gold_pages": ["anatomy-physiology-2e#p184"]
+  },
+  {
+    "question": "What are the phases of an action potential?",
+    "gold_pages": ["anatomy-physiology-2e#p505"]
+  },
+  {
+    "question": "What are the four chambers of the heart?",
+    "gold_pages": ["anatomy-physiology-2e#p792"]
+  },
+  {
+    "question": "What are the formed elements that make up blood?",
+    "gold_pages": ["anatomy-physiology-2e#p782"]
+  },
+  {
+    "question": "Compare the functions of insulin and glucagon.",
+    "gold_pages": ["anatomy-physiology-2e#p727", "anatomy-physiology-2e#p728"]
+  },
+  {
+    "question": "What are the two divisions of the autonomic nervous system?",
+    "gold_pages": ["anatomy-physiology-2e#p552"]
+  },
+  {
+    "question": "What are the major functions of the skeletal system?",
+    "gold_pages": ["anatomy-physiology-2e#p214", "anatomy-physiology-2e#p244"]
+  }
+]
