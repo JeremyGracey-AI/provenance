@@ -133,13 +133,13 @@ Retrieval and citation-overlap metrics are `0.000` here **by design** — the fa
 
 | metric | value |
 | --- | --- |
-| faithfulness (mean confidence) | _pending corpus build_ |
-| citation precision / recall / F1 | _pending corpus build_ |
-| recall@5 | _pending corpus build_ |
-| nDCG@5 | _pending corpus build_ |
-| well-formed | _pending corpus build_ |
+| faithfulness (mean confidence) | **0.985** |
+| citation precision / recall / F1 | **0.402 / 0.636 / 0.467** |
+| recall@5 | **0.864** |
+| nDCG@5 | **0.632** |
+| well-formed | **1.000** |
 
-_These numbers are filled in from a real run once the corpus is built — they are reported as measured, not aspirational._
+_Measured 2026-05-29 over the 11-question golden set (k=5) against the real Cohere Embed v4 index + `claude-sonnet-4-6`. **well-formed = 1.000**: every claim the system keeps cites a page that was actually retrieved and shown. **faithfulness = 0.985**: the fraction of claims the judge upheld against the page each one cites. Citation precision/recall are scored against a strict hand-labeled gold of 1–2 pages per question; the model frequently cites an *adjacent* page carrying the same content (the orbit of the eye, say, spans two pages), which the gold counts as a miss — so those two read as a conservative floor, not a ceiling. Reported as measured, not tuned._
 
 ---
 
