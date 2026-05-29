@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     # Pipeline knobs.
     top_k: int = 5  # pages retrieved per query
     max_repairs: int = 1  # re-answer attempts when claims come back unsupported
-    answer_max_tokens: int = 1024
+    answer_max_tokens: int = 2048  # headroom for a detailed answer + several cited claims in one tool call
     judge_max_tokens: int = 512
 
 

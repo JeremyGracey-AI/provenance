@@ -8,7 +8,7 @@ Using tool-use (not free-text JSON) is what makes evidence containing literal qu
 import anthropic
 import pytest
 
-from provenance.backends.vlm import HostedVLM, _image_block
+from provenance.backends.vlm import HostedVLM, _image_block, _resolve_citation
 from provenance.config import Settings
 from provenance.models import Claim, PageRef
 
@@ -93,3 +93,33 @@ def test_image_block_base64_fallback(tmp_path):
     assert block["source"]["type"] == "base64"
     assert block["source"]["media_type"] == "image/png"
     assert block["source"]["data"]
+
+
+def test_resolve_citation_maps_short_form_to_canonical_id():
+    # The real eval showed the model cites "p394" / "395", dropping the doc prefix.
+    pages = [
+        PageRef(doc_id="anatomy-physiology-2e", page_number=394, score=1.0, image_url="https://x/a_p394.png"),
+        PageRef(doc_id="anatomy-physiology-2e", page_number=395, score=0.9, image_url="https://x/a_p395.png"),
+    ]
+    assert _resolve_citation("p394", pages) == "anatomy-physiology-2e#p394"
+    assert _resolve_citation("395", pages) == "anatomy-physiology-2e#p395"
+    assert _resolve_citation("anatomy-physiology-2e#p394", pages) == "anatomy-physiology-2e#p394"
+    # A page that was not retrieved stays unchanged, so it still counts as malformed.
+    assert _resolve_citation("p999", pages) == "p999"
+
+
+def test_answer_resolves_short_citations(monkeypatch):
+    payload = {
+        "answer": "...",
+        "claims": [{"text": "The frontal bone forms the roof of the orbit.", "citations": ["p267"]}],
+    }
+
+    class _Msgs:
+        def create(self, *, system, messages, tools, tool_choice, **kwargs):
+            return _Response(payload)
+
+    monkeypatch.setattr(anthropic, "Anthropic", lambda *a, **k: type("C", (), {"messages": _Msgs()})())
+    vlm = HostedVLM(Settings(vlm_model="claude-sonnet-4-6"))
+    pages = [PageRef(doc_id="anatomy-physiology-2e", page_number=267, score=1.0, image_url="https://x/a_p267.png")]
+    answer = vlm.answer("Which bones form the orbit?", pages)
+    assert answer.claims[0].citations == ["anatomy-physiology-2e#p267"]

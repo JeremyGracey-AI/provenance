@@ -19,6 +19,7 @@ base64 when no URL is set (the bundled-subset build path). Verified against anth
 from __future__ import annotations
 
 import base64
+import re
 
 import anthropic
 
@@ -101,6 +102,26 @@ def _page_blocks(pages: list[PageRef]) -> list[dict]:
     return blocks
 
 
+def _resolve_citation(raw: str, pages: list[PageRef]) -> str:
+    """Map a model-emitted citation back to a retrieved page's canonical id.
+
+    The model reliably names the page *number* (e.g. "p394") but drops the doc prefix, so
+    "p394" must resolve to "anatomy-physiology-2e#p394". Exact-id citations pass through; a
+    citation that matches no retrieved page is returned unchanged, so a genuinely wrong cite
+    still reads as malformed in the metrics rather than being silently "fixed".
+    """
+    cleaned = raw.strip()
+    if any(cleaned == page.id for page in pages):
+        return cleaned
+    match = re.search(r"(\d+)\s*$", cleaned)
+    if match:
+        number = int(match.group(1))
+        for page in pages:
+            if page.page_number == number:
+                return page.id
+    return raw
+
+
 class HostedVLM:
     def __init__(self, settings: Settings) -> None:
         # api_key=None lets the SDK fall back to the ANTHROPIC_API_KEY environment variable.
@@ -139,8 +160,12 @@ class HostedVLM:
         content.append({"type": "text", "text": prompt})
         payload = self._run_tool(_ANSWER_SYSTEM, content, _ANSWER_TOOL, self._answer_max_tokens)
         claims = [
-            Claim(text=c["text"], citations=list(c.get("citations", [])))
+            Claim(
+                text=c["text"],
+                citations=[_resolve_citation(x, pages) for x in c.get("citations", [])],
+            )
             for c in payload.get("claims", [])
+            if c.get("text")
         ]
         return Answer(text=payload.get("answer", ""), claims=claims)
 
