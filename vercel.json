@@ -1,9 +1,11 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
   "functions": {
     "api/index.py": {
       "maxDuration": 300,
       "includeFiles": "{src/**,data/corpus/index.npy,data/corpus/manifest.json}"
     }
-  }
+  },
+  "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }]
 }

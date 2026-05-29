@@ -1,0 +1,19 @@
+# The API deploy ships only the Python function + its bundled index. Everything below is either
+# the WEB project's (web/), the 511 MB page corpus (served from Hugging Face, not the function),
+# local tooling, or test/build-only — none of it belongs in the serverless bundle.
+.git
+.venv
+node_modules
+web
+data/corpus/pages
+*.pdf
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.next
+.vercel
+.claude
+tests
+scripts
+*.egg-info
