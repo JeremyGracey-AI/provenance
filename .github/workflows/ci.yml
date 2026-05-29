@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test:
+    name: offline tests + plumbing gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Runtime + dev deps only. The `build` extra (pdf2image/huggingface-hub)
+      # and any API keys are intentionally absent: CI runs fully offline against
+      # the scripted fakes, so nothing here touches Cohere or Anthropic.
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+
+      - name: Unit tests
+        run: pytest -q
+
+      # run_eval.py with no args uses the demo pipeline (fakes) and asserts the
+      # PLUMBING_GATE (faithfulness == 1.0, well_formed == 1.0). It exits non-zero
+      # on failure, so a broken verify/repair loop or citation plumbing fails CI.
+      - name: Plumbing gate
+        run: python scripts/run_eval.py
