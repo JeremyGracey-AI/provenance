@@ -6,7 +6,7 @@ Provenance is a citation-grounded RAG system over the OpenStax *Anatomy & Physio
 
 There is **no GPU anywhere** in this project. Retrieval is Cohere Embed v4 (multimodal embeddings over page *images*), and answering + verification are Claude vision calls. Everything is API-based and runs on serverless functions.
 
-> **Live demo:** **[provenance-web-self.vercel.app](https://provenance-web-self.vercel.app)** · API: [provenance-api-lovat.vercel.app](https://provenance-api-lovat.vercel.app)
+> **Live demo:** **[provenance.icu](https://provenance.icu)** · API: [provenance-api-lovat.vercel.app](https://provenance-api-lovat.vercel.app)
 
 ---
 
@@ -145,12 +145,17 @@ _Measured 2026-05-29 over the 11-question golden set (k=5) against the real Cohe
 
 ## Deployment (Vercel)
 
-Two Vercel projects from this one repo:
+Live: **[provenance.icu](https://provenance.icu)** (WEB) → **[provenance-api-lovat.vercel.app](https://provenance-api-lovat.vercel.app)** (API). They're two separate Vercel projects off this one repo, both **auto-deploying on push to `master`**.
 
-- **API** — root `vercel.json` points the Python runtime at `api/index.py`, which wraps the real pipeline. The committed `data/corpus/{index.npy,manifest.json}` are bundled into the function via `includeFiles`; page *images* are served from Hugging Face, not the function. `maxDuration` is 300s to cover the verify→repair round-trips.
-- **WEB** — the `web/` Next.js app. Set `NEXT_PUBLIC_API_URL` to the deployed API URL.
+- **API** (`provenance-api`, Root Directory `./`) — root [`vercel.json`](vercel.json) sets `framework: null` so `api/index.py` is treated as a Python serverless function, bundles the committed `data/corpus/{index.npy,manifest.json}` via `includeFiles` (page *images* are served from Hugging Face, not the function), sets `maxDuration` 300s for the verify→repair round-trips, and rewrites every path to the function so FastAPI serves `/health` and `/query`. [`.vercelignore`](.vercelignore) keeps the 511 MB page corpus out of the bundle.
+- **WEB** (`provenance-web`, **Root Directory `web`**) — the Next.js app, served at **[provenance.icu](https://provenance.icu)** (with `www` → apex 308 redirect). Set the project's Root Directory to `web` in Vercel (it's a project setting, not a repo file); [`web/vercel.json`](web/vercel.json) pins the Next.js framework, and [`web/next.config.mjs`](web/next.config.mjs) rewrites `/query` and `/health` to the API so the browser only ever talks to one origin — no CORS.
 
-Environment variables (API project): `PROVENANCE_COHERE_API_KEY`, `ANTHROPIC_API_KEY`, `PROVENANCE_PAGES_BASE_URL`. See [`.env.example`](.env.example).
+Environment variables:
+
+- **API:** `PROVENANCE_COHERE_API_KEY`, `PROVENANCE_ANTHROPIC_API_KEY`, `PROVENANCE_PAGES_BASE_URL` (plus optional `PROVENANCE_VLM_MODEL`). On Vercel there is no shell fallback, so set `PROVENANCE_ANTHROPIC_API_KEY` explicitly. CORS is restricted to the WEB project's domains.
+- **WEB:** `NEXT_PUBLIC_API_URL` — left empty in production; the `next.config.mjs` rewrite proxies `/query` and `/health` to the API on the same origin. When unset (e.g. `next dev`), the app falls back to `http://localhost:8000`.
+
+See [`.env.example`](.env.example).
 
 ---
 
