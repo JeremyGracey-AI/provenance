@@ -1,0 +1,12 @@
+# Runtime deps for the Vercel API function ONLY — keep this light.
+# PDF rendering (pdf2image/poppler) and the HF upload (huggingface-hub) are build-time only
+# and would blow the 500 MB Python bundle, so they live in pyproject's [build] extra instead.
+langgraph>=0.2
+langchain-core>=0.3
+pydantic>=2.7
+pydantic-settings>=2.3
+fastapi>=0.110
+httpx>=0.27
+numpy>=1.26
+cohere>=5.13
+anthropic>=0.40
