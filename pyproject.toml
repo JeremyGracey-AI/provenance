@@ -53,3 +53,6 @@ packages = ["src/provenance"]
 addopts = "-q"
 testpaths = ["tests"]
 pythonpath = ["src"]
+filterwarnings = [
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated:Warning",
+]
