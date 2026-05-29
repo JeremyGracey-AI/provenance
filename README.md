@@ -6,7 +6,7 @@ Provenance is a citation-grounded RAG system over the OpenStax *Anatomy & Physio
 
 There is **no GPU anywhere** in this project. Retrieval is Cohere Embed v4 (multimodal embeddings over page *images*), and answering + verification are Claude vision calls. Everything is API-based and runs on serverless functions.
 
-> **Live demo:** _populated after the Vercel deploy._
+> **Live demo:** **[provenance-web-self.vercel.app](https://provenance-web-self.vercel.app)** · API: [provenance-api-lovat.vercel.app](https://provenance-api-lovat.vercel.app)
 
 ---
 
