@@ -30,3 +30,6 @@ out/
 
 # OS
 .DS_Store
+
+# Local tooling config (Claude Code launch/preview + local settings)
+.claude/
