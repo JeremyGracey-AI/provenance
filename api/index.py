@@ -20,7 +20,11 @@ from provenance.config import load_settings  # noqa: E402
 from provenance.deploy import real_pipeline  # noqa: E402
 
 app = create_app(real_pipeline(load_settings(), _ROOT / "data" / "corpus"))
-# Tighten allow_origins to the WEB domain for production.
+# Restrict CORS to the deployed WEB project's Vercel domains (production aliases + preview URLs),
+# rather than a blanket "*". The API holds no secrets in responses, but this is good hygiene.
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+    CORSMiddleware,
+    allow_origin_regex=r"https://provenance-web[\w-]*\.vercel\.app",
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
