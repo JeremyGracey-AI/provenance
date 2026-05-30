@@ -8,7 +8,14 @@ import {
   pageId,
 } from "@/lib/types";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+// Same-origin by default: production calls the relative /query and /health, which
+// next.config.mjs rewrites to the API project server-side — no CORS. Local dev (next dev)
+// talks to the API directly at localhost. Setting NEXT_PUBLIC_API_URL to an absolute URL
+// overrides both — but doing so in production defeats the rewrite and triggers CORS, so
+// leave it UNSET on the provenance-web Vercel project.
+const API_URL =
+  process.env.NEXT_PUBLIC_API_URL ??
+  (process.env.NODE_ENV === "development" ? "http://localhost:8000" : "");
 
 const EXAMPLES = [
   "What happens during depolarization in an action potential?",
