@@ -13,6 +13,9 @@ venv/
 # Rendered page images are uploaded to the Hugging Face dataset, not Git.
 data/corpus/pages/
 
+# Decision records (JSONL, one file per day) — runtime artifacts, never committed.
+records/
+
 # The index files ARE committed (they bundle into the Vercel function):
 #   data/corpus/index.npy
 #   data/corpus/manifest.json

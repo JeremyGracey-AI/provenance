@@ -11,14 +11,21 @@ and the whole UI flow are exercised end to end.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
 
 from provenance.api.app import create_app
 from provenance.config import load_settings
 from provenance.demo import demo_pipeline
+from provenance.records import JsonlSink
 
-app = create_app(demo_pipeline(load_settings()))
+# Decision records for every demo answer land under records/answers/ at the repo root
+# (gitignored — runtime artifacts). Verify them with: python -m provenance.records --verify records/answers/
+_RECORDS_DIR = Path(__file__).resolve().parent.parent / "records" / "answers"
+
+app = create_app(demo_pipeline(load_settings(), record_sink=JsonlSink(_RECORDS_DIR)))
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 if __name__ == "__main__":

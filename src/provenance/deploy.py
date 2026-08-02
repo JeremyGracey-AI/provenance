@@ -15,12 +15,15 @@ from provenance.backends.page_index import PageIndex
 from provenance.backends.vlm import HostedVLM
 from provenance.config import Settings
 from provenance.pipeline import Pipeline, build_pipeline
+from provenance.records import RecordSink
 
 
-def real_pipeline(settings: Settings, corpus_dir: Path) -> Pipeline:
+def real_pipeline(
+    settings: Settings, corpus_dir: Path, *, record_sink: RecordSink | None = None
+) -> Pipeline:
     assert settings.cohere_api_key, "set PROVENANCE_COHERE_API_KEY"
     assert settings.pages_base_url, "set PROVENANCE_PAGES_BASE_URL"
     index = PageIndex.load(corpus_dir / "index.npy", corpus_dir / "manifest.json")
     retriever = CohereEmbeddingRetriever(index, settings.pages_base_url, settings.cohere_api_key)
     vlm = HostedVLM(settings)  # answerer and judge
-    return build_pipeline(KeywordRouter(), retriever, vlm, vlm, settings)
+    return build_pipeline(KeywordRouter(), retriever, vlm, vlm, settings, record_sink)

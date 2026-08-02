@@ -29,6 +29,7 @@ class GraphState(TypedDict, total=False):
     pages: list[PageRef]
     answer: Answer
     verified: list[VerifiedClaim]
+    verify_fallbacks: list[bool]  # aligned with `verified`; True when the judge got all pages
     confidence: float
     repairs: int
     feedback: Optional[str]
@@ -53,13 +54,15 @@ def build_graph(
     def verify(state: GraphState) -> dict:
         pages_by_id = {page.id: page for page in state["pages"]}
         with state["trace"].span("verify", claims=len(state["answer"].claims)):
-            verified = [
-                judge.verify(claim, [pages_by_id[c] for c in claim.citations if c in pages_by_id] or state["pages"])
-                for claim in state["answer"].claims
-            ]
+            verified: list[VerifiedClaim] = []
+            fallbacks: list[bool] = []  # per claim: no citation resolved → judge saw ALL pages
+            for claim in state["answer"].claims:
+                cited = [pages_by_id[c] for c in claim.citations if c in pages_by_id]
+                fallbacks.append(not cited)
+                verified.append(judge.verify(claim, cited or state["pages"]))
         supported = sum(1 for v in verified if v.verdict == "supported")
         confidence = supported / len(verified) if verified else 0.0
-        return {"verified": verified, "confidence": confidence}
+        return {"verified": verified, "confidence": confidence, "verify_fallbacks": fallbacks}
 
     def repair(state: GraphState) -> dict:
         rejected = [v.text for v in state["verified"] if v.verdict == "unsupported"]

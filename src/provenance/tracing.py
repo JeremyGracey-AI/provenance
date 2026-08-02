@@ -18,6 +18,7 @@ class Span:
     name: str
     duration_ms: float
     detail: dict[str, object]
+    started_at: float  # wall-clock epoch seconds at span entry (time.time())
 
 
 @dataclass
@@ -26,12 +27,15 @@ class Trace:
 
     @contextmanager
     def span(self, name: str, **detail: object) -> Iterator[None]:
+        started_at = time.time()
         start = time.perf_counter()
         try:
             yield
         finally:
             elapsed = (time.perf_counter() - start) * 1000.0
-            self.spans.append(Span(name=name, duration_ms=elapsed, detail=dict(detail)))
+            self.spans.append(
+                Span(name=name, duration_ms=elapsed, detail=dict(detail), started_at=started_at)
+            )
 
     def summary(self) -> str:
         return " -> ".join(f"{s.name}({s.duration_ms:.0f}ms)" for s in self.spans)

@@ -18,8 +18,18 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from provenance.api.app import create_app  # noqa: E402
 from provenance.config import load_settings  # noqa: E402
 from provenance.deploy import real_pipeline  # noqa: E402
+from provenance.records import JsonlSink  # noqa: E402
 
-app = create_app(real_pipeline(load_settings(), _ROOT / "data" / "corpus"))
+# Decision records go to /tmp — the serverless filesystem is EPHEMERAL, so these survive only
+# the warm instance: honest best-effort until a durable store is chosen (open question). A sink
+# failure never breaks an answer (pipeline catches it; stderr warning only).
+app = create_app(
+    real_pipeline(
+        load_settings(),
+        _ROOT / "data" / "corpus",
+        record_sink=JsonlSink("/tmp/provenance-records"),
+    )
+)
 # Restrict CORS to the deployed WEB project's Vercel domains (production aliases + preview URLs),
 # rather than a blanket "*". The API holds no secrets in responses, but this is good hygiene.
 app.add_middleware(
