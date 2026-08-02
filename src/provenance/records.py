@@ -33,9 +33,27 @@ Verification (`python -m provenance.records --verify <file-or-dir>`) exits 0 iff
 record is schema-complete AND internally consistent:
   (a) confidence equals the fraction of claims with verdict "supported" (exact, unrounded —
       mirrors the verify node's own computation that `pipeline.py` passes through),
-  (b) every claim citation is a retrieved page id OR that claim's verify_fallback is true,
-  (c) run_id is unique within the verified set (across all files in a directory),
-  (d) trace started_at values are monotone non-decreasing within a record.
+  (b) verify_fallback is RECOMPUTED from the record and must match exactly:
+      `fallback == not any(citation in retrieved_ids)`, mirroring graph.py:60-61
+      (`cited = [...if c in pages_by_id]; fallbacks.append(not cited)`). The recompute is
+      sound because the record's `retrieved` IS `state["pages"]` — pipeline.py:33 passes
+      `final["pages"]` into GroundedAnswer, and graph.py:55 builds `pages_by_id` from the
+      same list. Before this check the flag was unvalidated self-certification
+      (2026-08-02 invigilation finding 8): setting it true made ANY citation set pass, and
+      `citations: []` + `verdict: supported` + `confidence: 1.0` verified clean. Note that
+      `citations: []` forces fallback True — graph.py's empty `cited` list is falsy — so a
+      record claiming citations-free grounding with fallback false is caught here,
+      by name, rather than needing a separate rule.
+  (c) every claim citation is a retrieved page id OR that claim's verify_fallback is true,
+  (d) run_id is unique within the verified set (across all files in a directory),
+  (e) trace started_at values are monotone non-decreasing within a record,
+  (f) `len(retrieved) <= k` — fully determined by the record (finding 9: a record padded to
+      40 retrieved ids with `k: 5` verified clean, and the padding is what made its
+      citations resolve).
+Schema completeness also rejects VACUOUS records (finding 9): question and model must be
+non-empty, `k >= 1`, and `timestamp` must actually PARSE as ISO 8601 — it was previously
+type-checked only, so `timestamp: "tuesday-ish"` passed. An all-empty record used to verify
+green, in a module that rejects an empty record *set* for exactly that reason.
 Any violation prints the file, record line, and field, and the process exits 1. Zero records
 found is also exit 1 — an empty set verifying green is exactly the false comfort this
 command exists to prevent (a stated, deliberate strictness beyond vacuous truth).
@@ -174,12 +192,26 @@ def _schema_violations(rec: dict, where: str) -> list[Violation]:
 
     expect(rec, "record_version", (int,), "record_version")
     expect(rec, "run_id", (str,), "run_id")
-    expect(rec, "timestamp", (str,), "timestamp")
-    expect(rec, "question", (str,), "question")
-    expect(rec, "model", (str,), "model")
-    expect(rec, "k", (int,), "k")
     expect(rec, "confidence", (int, float), "confidence")
     expect(rec, "repairs", (int,), "repairs")
+
+    # Vacuity checks (2026-08-02 invigilation finding 9): an all-empty record used to be
+    # schema-complete. A record that documents nothing is not a record.
+    timestamp = expect(rec, "timestamp", (str,), "timestamp")
+    if timestamp is not None:
+        try:
+            datetime.fromisoformat(timestamp)
+        except ValueError:
+            out.append(
+                Violation(where, "timestamp", f"not a parseable ISO 8601 timestamp: {timestamp!r}")
+            )
+    for field in ("question", "model"):
+        value = expect(rec, field, (str,), field)
+        if value is not None and not value.strip():
+            out.append(Violation(where, field, "empty — a record with no {} documents nothing".format(field)))
+    k = expect(rec, "k", (int,), "k")
+    if k is not None and k < 1:
+        out.append(Violation(where, "k", f"{k} < 1 — a run retrieves at least one page"))
 
     retrieved = expect(rec, "retrieved", (list,), "retrieved")
     if retrieved is not None:
@@ -239,9 +271,43 @@ def _consistency_violations(rec: dict, where: str) -> list[Violation]:
             )
         )
 
-    # (b) every citation resolves to a retrieved page id, unless the claim's verify_fallback
+    retrieved = rec["retrieved"]
+    retrieved_ids = {item["id"] for item in retrieved}
+
+    # (f) retrieved is bounded by k. Fully determined by the record, and the check the
+    #     padded record needed: 40 retrieved ids under `k: 5` is not a k=5 run, and the
+    #     padding is exactly what made its citations resolve (finding 9).
+    if len(retrieved) > rec["k"]:
+        out.append(
+            Violation(
+                where,
+                "retrieved",
+                f"{len(retrieved)} entries but k={rec['k']} — a run cannot retrieve more than k pages",
+            )
+        )
+
+    # (b) verify_fallback is RECOMPUTED, never trusted (finding 8). graph.py:60-61:
+    #         cited = [pages_by_id[c] for c in claim.citations if c in pages_by_id]
+    #         fallbacks.append(not cited)
+    #     so the flag is true iff NO citation resolved against the retrieved pages — which
+    #     also makes it true for an empty citation list. The record's `retrieved` is the
+    #     same `state["pages"]` graph.py indexed (pipeline.py:33), so this is exact.
+    for i, claim in enumerate(claims):
+        recomputed = not any(c in retrieved_ids for c in claim["citations"])
+        if bool(claim["verify_fallback"]) is not recomputed:
+            out.append(
+                Violation(
+                    where,
+                    f"claims[{i}].verify_fallback",
+                    f"recorded {claim['verify_fallback']!r} != recomputed {recomputed!r} "
+                    f"(citations {claim['citations']}, "
+                    f"{sum(1 for c in claim['citations'] if c in retrieved_ids)} of "
+                    f"{len(claim['citations'])} resolve against retrieved ids)",
+                )
+            )
+
+    # (c) every citation resolves to a retrieved page id, unless the claim's verify_fallback
     #     flag says the judge saw all retrieved pages instead.
-    retrieved_ids = {item["id"] for item in rec["retrieved"]}
     for i, claim in enumerate(claims):
         if claim["verify_fallback"]:
             continue
@@ -255,7 +321,7 @@ def _consistency_violations(rec: dict, where: str) -> list[Violation]:
                 )
             )
 
-    # (d) trace wall timestamps monotone non-decreasing.
+    # (e) trace wall timestamps monotone non-decreasing.
     spans = rec["trace"]
     for i in range(1, len(spans)):
         if spans[i]["started_at"] < spans[i - 1]["started_at"]:
@@ -301,7 +367,7 @@ def verify_paths(paths: Iterable[Path]) -> tuple[int, list[Violation]]:
                 violations.extend(schema)
                 continue  # consistency checks assume a clean schema
             violations.extend(_consistency_violations(rec, where))
-            # (c) run_id unique within the verified set.
+            # (d) run_id unique within the verified set.
             run_id = rec["run_id"]
             if run_id in seen_run_ids:
                 violations.append(
