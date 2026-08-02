@@ -19,7 +19,14 @@ def recall_at_k(retrieved_ids: list[str], gold_ids: set[str], k: int) -> float:
 
 def ndcg_at_k(retrieved_ids: list[str], gold_ids: set[str], k: int) -> float:
     assert gold_ids, "nDCG@k needs at least one gold page"
-    dcg = sum(1.0 / math.log2(rank + 2) for rank, rid in enumerate(retrieved_ids[:k]) if rid in gold_ids)
+    # Binary relevance: a gold id earns gain once, at its first-ranked occurrence.
+    # Duplicate ids in retrieved_ids previously inflated DCG past IDCG (nDCG > 1).
+    seen: set[str] = set()
+    dcg = 0.0
+    for rank, rid in enumerate(retrieved_ids[:k]):
+        if rid in gold_ids and rid not in seen:
+            dcg += 1.0 / math.log2(rank + 2)
+            seen.add(rid)
     ideal_hits = min(len(gold_ids), k)
     idcg = sum(1.0 / math.log2(rank + 2) for rank in range(ideal_hits))
     return dcg / idcg if idcg else 0.0

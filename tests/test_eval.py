@@ -22,6 +22,15 @@ def test_ndcg_at_k_rewards_rank():
     assert ndcg_at_k(["b", "a"], {"b"}, k=2) == pytest.approx(1.0)
 
 
+def test_ndcg_at_k_duplicate_ids_bounded():
+    # A duplicate of an already-counted gold id earns no extra gain; nDCG stays <= 1.
+    # (Regression: DCG used to count the duplicate while IDCG truncated -> nDCG 1.63.)
+    assert ndcg_at_k(["a", "a"], {"a"}, k=2) == pytest.approx(1.0)
+    assert ndcg_at_k(["a", "a", "b"], {"a", "b"}, k=3) == pytest.approx(
+        (1.0 + 1.0 / math.log2(4)) / (1.0 + 1.0 / math.log2(3))
+    )
+
+
 def test_citation_prf():
     precision, recall, f1 = citation_prf({"a", "b"}, {"b", "c"})
     assert (precision, recall, f1) == (0.5, 0.5, 0.5)
