@@ -35,6 +35,11 @@ create table if not exists public.answer_records (
 
     -- Requester identity. NULLABLE by design: records written by eval runs, the CLI, or any
     -- non-HTTP caller carry none of these, and that absence is meaningful.
+    --
+    -- request_id is minted server-side (uuid4 hex); the inbound x-request-id header is NOT
+    -- reused, because a caller-supplied string written straight into this table is an
+    -- unauthenticated write into the record store. user_agent, by contrast, IS caller-
+    -- controlled text and is stored knowingly — that is what a User-Agent is.
     request_id        text,
     user_agent        text,
     -- Salted SHA-256 of the client address (src/provenance/records.py:hash_client).

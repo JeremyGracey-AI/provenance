@@ -27,8 +27,12 @@ Record schema, `record_version` 1 — one JSON object per line:
 Optional requester fields — present ONLY when the answer was served over HTTP with a
 composed `Settings` (see `api/app.py`); absent for eval runs, the CLI, and tests:
 
-    request_id       str      inbound x-request-id / x-vercel-id / x-amzn-trace-id, else uuid4 hex
-    user_agent       str      the raw User-Agent header, truncated
+    request_id       str      uuid4 hex, minted server-side per HTTP request. Inbound
+                              x-request-id / x-vercel-id is deliberately NOT trusted: it is
+                              caller-supplied text, so reusing it would be an unauthenticated
+                              write into the record store (api/app.py:_request_id says why)
+    user_agent       str      the User-Agent header, truncated — caller-controlled, and
+                              stored as such on purpose: a coarse client hint is the point
     client_hash      str      SALTED SHA-256 of the client address — never the address itself
 
 `record_version` stays **1**. These three are optional ADDITIONS: a v1 record without them

@@ -27,11 +27,6 @@ from provenance.config import Settings
 from provenance.models import GroundedAnswer
 from provenance.pipeline import Pipeline
 
-# Reuse an id the edge already assigned when there is one, so a record can be joined against
-# platform logs; x-vercel-id is what this deployment actually gets in production.
-_REQUEST_ID_HEADERS = ("x-request-id", "x-vercel-id", "x-amzn-trace-id")
-
-_MAX_REQUEST_ID = 200
 _MAX_USER_AGENT = 300
 
 
@@ -40,10 +35,19 @@ class QueryRequest(BaseModel):
 
 
 def _request_id(request: Request) -> str:
-    for header in _REQUEST_ID_HEADERS:
-        value = request.headers.get(header)
-        if value:
-            return value[:_MAX_REQUEST_ID]
+    """A server-minted id. Inbound `x-request-id` / `x-vercel-id` is deliberately IGNORED.
+
+    Reusing the edge's id would make records joinable against platform logs, which is worth
+    something — but `x-request-id` is caller-supplied free text, so reusing it turns this
+    field into an unauthenticated write into the record store. A caller could put their own
+    IP (or anyone's, or any other PII) there and Provenance would store it verbatim, which
+    is the exact guarantee `hash_client` exists to make impossible. No character filter
+    fixes that: an IPv4 literal is dots and digits and passes any conservative charset.
+
+    So the field is always ours: uuid4 hex, unique per request, trusted because we made it.
+    If log-joining is wanted later it needs its own column, named as caller-supplied and
+    verified as untrusted — a schema decision, not a default.
+    """
     return uuid.uuid4().hex
 
 

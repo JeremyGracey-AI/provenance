@@ -209,19 +209,40 @@ def test_requester_fields_recorded_within_a_request():
     assert response.status_code == 200
 
     (record,) = sink.records
-    assert record["request_id"] == "req-abc-123"  # the edge's id is reused, not replaced
     assert record["user_agent"] == "pytest-ua/1.0"
     assert len(record["client_hash"]) == 64
     assert set(record["client_hash"]) <= set("0123456789abcdef")
+    # request_id is ours, never the caller's — see the inbound-header test below.
+    assert len(record["request_id"]) == 32
+    int(record["request_id"], 16)  # uuid4 hex
+    assert record["request_id"] != "req-abc-123"
 
 
-def test_request_id_is_generated_when_no_header_carries_one():
+def test_request_id_is_always_server_minted():
+    """Two requests, one supplying an id and one not, both get a fresh uuid4 and differ."""
     sink = CaptureSink()
     client = _client(sink, settings=_settings(client_hash_salt="fixed-test-salt"))
     assert client.post("/query", json={"query": _Q}).status_code == 200
-    (record,) = sink.records
-    assert len(record["request_id"]) == 32
-    int(record["request_id"], 16)  # uuid4 hex
+    assert client.post("/query", json={"query": _Q}, headers={"x-request-id": "req-B"}).status_code == 200
+    first, second = (record["request_id"] for record in sink.records)
+    for value in (first, second):
+        assert len(value) == 32
+        int(value, 16)
+    assert first != second
+
+
+def test_inbound_request_id_header_is_never_stored():
+    """The header is caller-supplied free text, so trusting it would be an unauthenticated
+    write into the record store — a caller could simply hand us the IP that `client_hash`
+    exists to keep out, and no charset filter catches an IPv4 literal."""
+    sink = CaptureSink()
+    client = _client(sink, settings=_settings(client_hash_salt="fixed-test-salt"))
+    for header in ("x-request-id", "x-vercel-id", "x-amzn-trace-id"):
+        response = client.post("/query", json={"query": _Q}, headers={header: _ADDRESS})
+        assert response.status_code == 200
+    for record in sink.records:
+        assert record["request_id"] != _ADDRESS
+        assert _ADDRESS not in json.dumps(record)
 
 
 def test_no_requester_fields_outside_a_request(tmp_path):
@@ -256,11 +277,13 @@ def test_identity_does_not_leak_into_a_later_request():
     pipeline.run(_Q)  # and a direct call on the main thread
 
     first, second, third = sink.records
-    assert first["request_id"] == "req-A" and first["user_agent"] == "ua-A" and first["client_hash"]
+    assert first["user_agent"] == "ua-A" and first["client_hash"] and first["request_id"]
     for later in (second, third):
         assert not any(field in later for field in records.REQUESTER_FIELDS), later
         assert _ADDRESS not in json.dumps(later)
-        assert "req-A" not in json.dumps(later)
+        assert "ua-A" not in json.dumps(later)
+    # The inbound id is not stored in ANY record, leaked or otherwise.
+    assert "req-A" not in json.dumps(sink.records)
 
 
 def test_client_hash_is_a_hash_and_the_raw_address_is_never_stored(capsys):
@@ -268,8 +291,22 @@ def test_client_hash_is_a_hash_and_the_raw_address_is_never_stored(capsys):
     sink = CaptureSink()
     client = _client(sink, settings=_settings(client_hash_salt="fixed-test-salt"))
     for address in (_ADDRESS, _ADDRESS, _OTHER_ADDRESS):
-        response = client.post("/query", json={"query": _Q}, headers={"x-forwarded-for": address})
+        response = client.post(
+            "/query",
+            json={"query": _Q},
+            headers={
+                "x-forwarded-for": address,
+                # The adversarial case: hand the address back through a field the caller
+                # controls. It must not survive into the record by that route either.
+                "x-request-id": address,
+                "user-agent": "pytest-ua/1.0",
+            },
+        )
         assert response.status_code == 200
+    # user_agent IS stored verbatim, deliberately: it is a coarse client hint, it is what a
+    # User-Agent header is for, and it is truncated. The distinction from the address is a
+    # decision, so it is asserted rather than left implicit.
+    assert all(record["user_agent"] == "pytest-ua/1.0" for record in sink.records)
     same_a, same_b, different = (record["client_hash"] for record in sink.records)
     assert same_a == same_b  # the same caller groups...
     assert different != same_a  # ...and a different one does not
