@@ -17,6 +17,7 @@ HTTP is an `httpx.MockTransport`.
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 import httpx
@@ -389,3 +390,35 @@ def test_a_user_agent_that_is_only_padded_is_kept_verbatim(tmp_path):
     path.write_text(json.dumps(record) + "\n")
     assert records.main(["--verify", str(path)]) == 0
 
+
+def test_client_hash_is_exactly_sha256_of_salt_pipe_address():
+    """Pin the hash INPUT, not just its shape: `sha256(f"{salt}|{address}")` and nothing else.
+
+    Folded in from the 2026-08-02 gate, which proved it by hand and said so. The expectation
+    is a literal digest computed with `hashlib`, never with `hash_client` — deriving it from
+    the function under test would assert `f(x) == f(x)` and pin nothing. Varying user_agent
+    and question across the three posts is the discriminating half: the address is the ONLY
+    input, so a hash that quietly mixed in anything else would move here."""
+    expected = hashlib.sha256(b"fixed-test-salt|203.0.113.47").hexdigest()
+    assert _ADDRESS == "203.0.113.47"  # the byte literal above spelled out, so it stays honest
+
+    sink = CaptureSink()
+    client = _client(sink, settings=_settings(client_hash_salt="fixed-test-salt"))
+    for user_agent, question in (
+        ("pytest-ua/1.0", _Q),
+        ("a-completely-different-agent/9.9", _Q),
+        ("pytest-ua/1.0", "Which tissue lines the body's cavities?"),
+    ):
+        response = client.post(
+            "/query",
+            json={"query": question},
+            headers={"user-agent": user_agent, "x-forwarded-for": _ADDRESS},
+        )
+        assert response.status_code == 200
+
+    assert len({record["user_agent"] for record in sink.records}) == 2  # the varying happened
+    assert len({record["question"] for record in sink.records}) == 2
+    assert [record["client_hash"] for record in sink.records] == [expected] * 3
+    assert records.hash_client(_ADDRESS, salt="fixed-test-salt") == expected
+    # The address is an input, not a decoration: change it and the digest moves.
+    assert records.hash_client(_OTHER_ADDRESS, salt="fixed-test-salt") != expected
