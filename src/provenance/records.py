@@ -302,6 +302,41 @@ class JsonlSink:
             fh.write(line + "\n")
 
 
+def _safe_failure_detail(exc: BaseException) -> str:
+    """What an exception is allowed to say in a log line: its TYPE, and nothing it carries.
+
+    This function is a SECURITY control, not formatting. `HttpSink.write` used to log
+    `{exc!r}`, and the exception on that path is raised while httpx encodes headers that
+    contain `PROVENANCE_RECORDS_KEY` — a **service_role** secret per
+    `docs/records-schema.sql`. A key with any non-ASCII byte (a trailing NBSP off a paste, a
+    curly apostrophe) makes httpx raise `UnicodeEncodeError`, whose `.args` carry the WHOLE
+    key string, so the repr printed the secret to stderr — which on Vercel is the permanent
+    platform log — on every answer, while the API kept returning 200 (2026-08-03
+    invigilation, defect 2).
+
+    The fix is deliberately NOT "special-case UnicodeEncodeError". An arbitrary exception
+    raised anywhere inside that `try` may carry the key, the URL (PostgREST accepts `apikey`
+    as a query parameter, so the URL is credential-bearing too), or the caller's question —
+    and `str`/`repr`/`.args` are how every one of them travels. So the rule is a WHITELIST:
+    the class name, which is source code and cannot carry data, plus an HTTP status code when
+    there is one, which is an int from the response line. Nothing else, ever.
+
+    The status code is the one concession, and it is what makes the line useful: a 401 says
+    "the key is wrong" and a 404 says "the table is not there", and telling those apart is the
+    whole point of a warning nobody can act on otherwise. It is read defensively (a bad
+    `.response` must not turn a logging call into the exception that breaks an answer) and
+    accepted only if it really is an int.
+    """
+    name = type(exc).__name__
+    try:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    except Exception:  # a property that raises must not break the fail-open path
+        status = None
+    if isinstance(status, int) and not isinstance(status, bool):
+        return f"{name} status={status}"
+    return name
+
+
 class HttpSink:
     """POST one record per answer to a REST endpoint (PostgREST/Supabase shape).
 
@@ -311,7 +346,7 @@ class HttpSink:
     PostgREST wants them (`apikey`, `Authorization: Bearer`, `Prefer: return=minimal` so the
     row is not echoed back).
 
-    Two properties this class exists to guarantee:
+    Three properties this class exists to guarantee:
 
     * **Bounded.** `timeout` (default 2s) caps the whole exchange. The record is written on
       the request's own thread, so a store having a bad day must not become the API having a
@@ -322,6 +357,12 @@ class HttpSink:
       name the sink that actually failed. An answer is never lost because its record was.
       The cost is stated plainly: a dropped record is invisible to the caller, so the warning
       is the only signal, and Day 2's "break the credential in prod" test is what proves it.
+    * **The warning cannot leak the credential.** Fail-open means EVERY exception reaches a
+      `print`, and this frame holds a service_role key, so the formatting of that line is a
+      security control: it prints `_safe_failure_detail(exc)` — a class name, plus a status
+      code when the failure was an HTTP status — and never the exception's text. See that
+      function for the leak this closes and why type-only is the rule rather than a special
+      case for one exception class.
 
     `transport` is a test seam (`httpx.MockTransport`) and is None in production.
     """
@@ -354,7 +395,14 @@ class HttpSink:
                 response = client.post(self._url, content=payload, headers=headers)
             response.raise_for_status()
         except Exception as exc:  # fail-open: the answer already exists; the record is best-effort
-            print(f"[provenance.records] http sink failed, record dropped: {exc!r}", file=sys.stderr)
+            # NEVER `{exc!r}`, `{exc}`, or `exc.args` here: this frame runs with the
+            # service_role key in scope and the exception may carry it (defect 2). Only
+            # `_safe_failure_detail` — a class name and maybe a status int — reaches the log.
+            print(
+                f"[provenance.records] http sink failed, record dropped: "
+                f"{_safe_failure_detail(exc)}",
+                file=sys.stderr,
+            )
 
 
 class NullSink:

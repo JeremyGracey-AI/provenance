@@ -168,6 +168,78 @@ def test_http_sink_write_returns_none_on_failure():
     assert sink.write({"run_id": "x"}) is None
 
 
+# ------------------------------------------------------------------ the warning cannot leak
+#
+# 2026-08-03 invigilation, defect 2 — the one that blocked Day 2. `HttpSink.write` logged
+# `{exc!r}`, and this frame holds `PROVENANCE_RECORDS_KEY`, a **service_role** secret
+# (docs/records-schema.sql governance note). A key with one non-ASCII byte makes httpx raise
+# `UnicodeEncodeError` while encoding the `apikey`/`Authorization` headers, and that
+# exception's `.args` carry the WHOLE key — so the secret went to stderr, which on Vercel is
+# the permanent platform log, on EVERY answer, while the API kept returning 200.
+#
+# A key that is not routable and not real, but shaped like one, so a false negative in these
+# tests is still not a disclosure:
+_LEAKY_KEY = "sb_secret_fake9f3c2a1b7d\xa0"  # trailing U+00A0 — the paste artefact that triggers it
+_LEAKY_KEY_ASCII = "sb_secret_fake9f3c2a1b7d"  # the part a repr would print verbatim
+
+
+def test_the_key_is_absent_from_stderr_when_the_key_itself_cannot_be_encoded(capsys):
+    """Defect 2's exact reproduction: non-ASCII key in, and the key must not come out.
+
+    Both needles matter. The full key proves the repr is gone; the ASCII prefix proves it did
+    not survive in a partial or escaped form (`repr` of `'…\\xa0'` prints every preceding
+    character literally, so the prefix is the substring an attacker actually needs)."""
+    sink = HttpSink(_URL, _LEAKY_KEY, transport=httpx.MockTransport(lambda r: httpx.Response(201)))
+    assert sink.write({"run_id": "x" * 32}) is None  # still fail-open
+
+    err = capsys.readouterr().err
+    assert "[provenance.records] http sink failed" in err  # the failure IS audible...
+    assert _LEAKY_KEY not in err  # ...and says nothing about the credential
+    assert _LEAKY_KEY_ASCII not in err
+    assert "\xa0" not in err
+    assert "UnicodeEncodeError" in err  # the TYPE is what an operator gets to see
+
+
+def test_the_key_is_absent_from_stderr_when_an_arbitrary_exception_carries_it(capsys):
+    """The reason the fix is not `except UnicodeEncodeError`.
+
+    ANY exception raised inside `write` may carry the key — a transport, a proxy library, an
+    auth helper interpolating the header it was handed. This one puts the key in the message
+    of a plain `RuntimeError`, which no special case for one exception class would catch. The
+    control is the whitelist: type name only."""
+
+    def leak_in_the_message(request: httpx.Request) -> httpx.Response:
+        raise RuntimeError(f"upstream rejected apikey={_KEY} authorization=Bearer {_KEY}")
+
+    sink = HttpSink(_URL, _KEY, transport=httpx.MockTransport(leak_in_the_message))
+    assert sink.write({"run_id": "x" * 32}) is None
+
+    err = capsys.readouterr().err
+    assert _KEY not in err
+    assert "apikey=" not in err
+    assert "RuntimeError" in err
+
+
+def test_a_clean_key_connect_error_still_says_something_an_operator_can_act_on(capsys):
+    """The other half: suppressing the message must not turn the warning into noise.
+
+    A connect failure names `ConnectError`; a rejected credential names its status. Those two
+    are the diagnosis — "the store is unreachable" vs "the key is wrong" — and a fix that made
+    them indistinguishable would trade one silent failure for another."""
+    sink = HttpSink(_URL, _KEY, transport=httpx.MockTransport(_explode))
+    assert sink.write({"run_id": "x" * 32}) is None
+    err = capsys.readouterr().err
+    assert "[provenance.records] http sink failed, record dropped:" in err
+    assert "ConnectError" in err
+    assert _KEY not in err
+
+    sink = HttpSink(_URL, _KEY, transport=httpx.MockTransport(_unauthorized))
+    assert sink.write({"run_id": "y" * 32}) is None
+    err = capsys.readouterr().err
+    assert "HTTPStatusError" in err and "status=401" in err
+    assert _KEY not in err
+
+
 # ---------------------------------------------------------------------- sink_from_settings
 
 
