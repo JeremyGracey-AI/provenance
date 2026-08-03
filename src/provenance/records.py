@@ -24,6 +24,18 @@ Record schema, `record_version` 1 — one JSON object per line:
     trace            list     [{name, duration_ms, detail, started_at}] per span;
                               started_at is a wall-clock epoch float captured at span entry
 
+Optional requester fields — present ONLY when the answer was served over HTTP with a
+composed `Settings` (see `api/app.py`); absent for eval runs, the CLI, and tests:
+
+    request_id       str      inbound x-request-id / x-vercel-id / x-amzn-trace-id, else uuid4 hex
+    user_agent       str      the raw User-Agent header, truncated
+    client_hash      str      SALTED SHA-256 of the client address — never the address itself
+
+`record_version` stays **1**. These three are optional ADDITIONS: a v1 record without them
+is still valid, a record with them is a superset, and the verifier below checks them only
+`if present`. Bumping the version would buy nothing and would force version dispatch into
+`--verify`, which must keep reading the records already on disk.
+
 Named gap — raw_citations: not captured, vlm coercion discards — gap. `HostedVLM.answer`
 coerces model-emitted citations via `_resolve_citation` (backends/vlm.py:105-122) and drops
 the original string; threading it here would add fields to `Claim` AND `VerifiedClaim` (the
@@ -62,13 +74,18 @@ command exists to prevent (a stated, deliberate strictness beyond vacuous truth)
 from __future__ import annotations
 
 import argparse
+import contextvars
+import hashlib
 import json
 import sys
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, Protocol
+from typing import TYPE_CHECKING, Iterable, Iterator, Protocol
+
+import httpx
 
 if TYPE_CHECKING:
     from provenance.config import Settings
@@ -78,6 +95,74 @@ if TYPE_CHECKING:
 RECORD_VERSION = 1
 
 _VERDICTS = ("supported", "unsupported")
+
+
+# ----------------------------------------------------------------------- requester context
+#
+# Who asked, without changing `Pipeline.run(question) -> GroundedAnswer`. That signature is
+# the eval contract's duck type (`harness_eval/protocol.py`) and Week 2's zero-drift proof
+# rests on it, so the requester travels out-of-band in a ContextVar that the HTTP handler
+# sets and `build_record` reads. Callers with no HTTP request — eval runs, the CLI, tests —
+# simply never set it, and the fields are then absent rather than empty.
+
+_REQUESTER: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "provenance_requester", default=None
+)
+
+REQUESTER_FIELDS = ("request_id", "user_agent", "client_hash")
+
+
+def hash_client(address: str | None, *, salt: str) -> str | None:
+    """Salted SHA-256 of a client address. The ONLY form in which it is ever stored.
+
+    The privacy choice, stated where it is enforced rather than in a policy doc: Provenance
+    records *that the same someone asked twice*, never *who*. A raw IP is never written to a
+    record, never logged, and never returned; it exists only as the argument to this call.
+
+    The salt does real work here, so its handling is a security property, not hygiene: SHA-256
+    over the 2^32 IPv4 space is trivially enumerable, so an UNSALTED or publicly-known-salt
+    hash is a reversible IP. `Settings.client_hash_salt` documents the default (a random
+    per-process salt, which makes hashes correlatable only within one instance's lifetime);
+    a configured salt must be treated as a secret.
+
+    Returns None for a missing/empty address, which `requester_context` drops entirely.
+    """
+    if not address:
+        return None
+    return hashlib.sha256(f"{salt}|{address}".encode("utf-8")).hexdigest()
+
+
+@contextmanager
+def requester_context(
+    *,
+    request_id: str | None = None,
+    user_agent: str | None = None,
+    client_hash: str | None = None,
+) -> Iterator[None]:
+    """Bind requester identity for the duration of one request, then unbind it.
+
+    The unbinding is a `finally: reset(token)`, deliberately structural: FastAPI runs a sync
+    handler on a REUSED worker thread, and identity from request A surviving into request B's
+    record would be a privacy failure, not a cosmetic one. Two independent mechanisms now
+    prevent it — each request already runs in its own copied context, AND this token reset —
+    so the guarantee does not depend on anyio's context-copying staying as it is today.
+    """
+    fields = {
+        "request_id": request_id,
+        "user_agent": user_agent,
+        "client_hash": client_hash,
+    }
+    present = {key: value for key, value in fields.items() if value}
+    token = _REQUESTER.set(present or None)
+    try:
+        yield
+    finally:
+        _REQUESTER.reset(token)
+
+
+def current_requester() -> dict | None:
+    """The requester bound to this context, or None outside a request."""
+    return _REQUESTER.get()
 
 
 # --------------------------------------------------------------------------- record build
@@ -102,7 +187,7 @@ def build_record(
                 "verify_fallback": bool(flags[i]) if i < len(flags) else False,
             }
         )
-    return {
+    record = {
         "record_version": RECORD_VERSION,
         "run_id": uuid.uuid4().hex,
         "timestamp": datetime.now().astimezone().isoformat(),
@@ -123,6 +208,14 @@ def build_record(
             for span in trace.spans
         ],
     }
+    # Requester identity, when an HTTP handler bound one. Absent — not empty, not null —
+    # for every other caller, so a record never claims to know who asked when it does not.
+    requester = current_requester() or {}
+    for field in REQUESTER_FIELDS:
+        value = requester.get(field)
+        if value:
+            record[field] = value
+    return record
 
 
 # --------------------------------------------------------------------------------- sinks
@@ -147,11 +240,87 @@ class JsonlSink:
             fh.write(line + "\n")
 
 
+class HttpSink:
+    """POST one record per answer to a REST endpoint (PostgREST/Supabase shape).
+
+    The durable half of the story: `JsonlSink` on a serverless filesystem writes to a disk
+    that disappears with the invocation, so a record that must outlive the request has to
+    leave the process. One `POST {url}` per answer, body = the record dict, headers as
+    PostgREST wants them (`apikey`, `Authorization: Bearer`, `Prefer: return=minimal` so the
+    row is not echoed back).
+
+    Two properties this class exists to guarantee:
+
+    * **Bounded.** `timeout` (default 2s) caps the whole exchange. The record is written on
+      the request's own thread, so a store having a bad day must not become the API having a
+      bad day.
+    * **Fail-open.** EVERY exception is caught here — connect errors, timeouts, non-2xx via
+      `raise_for_status`, even a body that will not serialize — and downgraded to one stderr
+      warning. `pipeline.py` catches at the seam too; this inner catch means the warning can
+      name the sink that actually failed. An answer is never lost because its record was.
+      The cost is stated plainly: a dropped record is invisible to the caller, so the warning
+      is the only signal, and Day 2's "break the credential in prod" test is what proves it.
+
+    `transport` is a test seam (`httpx.MockTransport`) and is None in production.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        key: str,
+        *,
+        timeout: float = 2.0,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        self._url = url
+        self._key = key
+        self._timeout = timeout
+        self._transport = transport
+
+    def write(self, record: dict) -> None:
+        try:
+            # `default=str` matches JsonlSink byte-for-byte, so the two sinks cannot disagree
+            # about what a record is; `content=` (not `json=`) is what keeps that guarantee.
+            payload = json.dumps(record, ensure_ascii=False, default=str).encode("utf-8")
+            headers = {
+                "apikey": self._key,
+                "Authorization": f"Bearer {self._key}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            }
+            with httpx.Client(timeout=self._timeout, transport=self._transport) as client:
+                response = client.post(self._url, content=payload, headers=headers)
+            response.raise_for_status()
+        except Exception as exc:  # fail-open: the answer already exists; the record is best-effort
+            print(f"[provenance.records] http sink failed, record dropped: {exc!r}", file=sys.stderr)
+
+
 class NullSink:
     """Explicitly off — same as passing record_sink=None, for callers that want a named off."""
 
     def write(self, record: dict) -> None:
         return None
+
+
+def sink_from_settings(settings: "Settings") -> "RecordSink | None":
+    """Compose the sink from config, so no caller has to branch on deployment.
+
+    Precedence, and the reason for it:
+      1. `records_url` + `records_key` -> `HttpSink`. Durable beats local when both are set.
+      2. `records_dir`                 -> `JsonlSink`. Local development and the demo server.
+      3. neither                       -> `None`. NO records. Not a silent degradation to a
+         path that will be deleted — an absence you can see, which is the honest state for an
+         unconfigured deployment.
+    A URL without a key (or a key without a URL) is not "configured": it falls through, and
+    the dir/None rules decide.
+    """
+    if settings.records_url and settings.records_key:
+        return HttpSink(
+            settings.records_url, settings.records_key, timeout=settings.records_timeout_s
+        )
+    if settings.records_dir:
+        return JsonlSink(settings.records_dir)
+    return None
 
 
 # -------------------------------------------------------------------------- verification
@@ -212,6 +381,16 @@ def _schema_violations(rec: dict, where: str) -> list[Violation]:
     k = expect(rec, "k", (int,), "k")
     if k is not None and k < 1:
         out.append(Violation(where, "k", f"{k} < 1 — a run retrieves at least one page"))
+
+    # Requester fields are OPTIONAL (absent for eval/CLI/test runs, present for HTTP answers),
+    # but present-and-empty is not a third state: it would be a record asserting it knows who
+    # asked while carrying nothing. `build_record` never emits that; `--verify` refuses it.
+    for field in REQUESTER_FIELDS:
+        if field not in rec:
+            continue
+        value = expect(rec, field, (str,), field)
+        if value is not None and not value.strip():
+            out.append(Violation(where, field, "present but empty — omit the field instead"))
 
     retrieved = expect(rec, "retrieved", (list,), "retrieved")
     if retrieved is not None:

@@ -28,6 +28,25 @@ class Settings(BaseSettings):
     answer_max_tokens: int = 2048  # headroom for a detailed answer + several cited claims in one tool call
     judge_max_tokens: int = 512
 
+    # Decision records. Which sink runs is CONFIG, not a branch in the caller —
+    # `records.sink_from_settings(settings)` reads exactly these fields:
+    #   url + key set -> HttpSink     (durable, survives the request)
+    #   dir set       -> JsonlSink    (local file, one per day)
+    #   neither       -> None         (no records at all, by design and visibly so)
+    records_url: str | None = None  # REST endpoint, e.g. https://<ref>.supabase.co/rest/v1/answer_records
+    records_key: str | None = None  # API key for that endpoint; server-side only, never shipped to a browser
+    records_dir: str | None = None  # local JSONL directory (JsonlSink) when no URL is configured
+    records_timeout_s: float = 2.0  # hard cap on the record POST — an answer never waits on the store
+
+    # Salt for the client-address hash written into records (see `records.hash_client`).
+    # Documented default: UNSET means the API mints a RANDOM per-process salt at
+    # `create_app` time. Consequence, stated so nobody discovers it in a dashboard: hashes
+    # are then comparable only within one running instance and change on every restart or
+    # new serverless instance. That is the privacy-conservative default; set this to a
+    # stable secret only if you actually want cross-instance correlation, and treat it as a
+    # secret when you do — a KNOWN salt makes the 2^32 IPv4 space brute-forceable.
+    client_hash_salt: str | None = None
+
 
 def load_settings() -> Settings:
     return Settings()

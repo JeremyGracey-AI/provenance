@@ -18,17 +18,31 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from provenance.api.app import create_app  # noqa: E402
 from provenance.config import load_settings  # noqa: E402
 from provenance.deploy import real_pipeline  # noqa: E402
-from provenance.records import JsonlSink  # noqa: E402
+from provenance.records import sink_from_settings  # noqa: E402
 
-# Decision records go to /tmp — the serverless filesystem is EPHEMERAL, so these survive only
-# the warm instance: honest best-effort until a durable store is chosen (open question). A sink
-# failure never breaks an answer (pipeline catches it; stderr warning only).
+_SETTINGS = load_settings()
+
+# Where decision records go is settings' call, not this file's: PROVENANCE_RECORDS_URL +
+# PROVENANCE_RECORDS_KEY -> HttpSink (durable), else PROVENANCE_RECORDS_DIR -> JsonlSink,
+# else NO RECORDS AT ALL.
+#
+# That last branch is the deliberate part, and it replaces `JsonlSink("/tmp/provenance-records")`.
+# On Vercel /tmp is per-invocation, so those records were written, believed durable, and gone —
+# a trace that exists only until you go looking for it is worse than no trace, because the
+# absence is the only part that is honest. Unconfigured now means the records are missing and
+# visibly missing. Configure the two env vars to make them real (schema: docs/records-schema.sql).
+#
+# Either way, a sink failure never breaks an answer: HttpSink swallows and warns to stderr, and
+# pipeline.py catches again at the build_record/write seam.
 app = create_app(
     real_pipeline(
-        load_settings(),
+        _SETTINGS,
         _ROOT / "data" / "corpus",
-        record_sink=JsonlSink("/tmp/provenance-records"),
-    )
+        record_sink=sink_from_settings(_SETTINGS),
+    ),
+    # Passing settings here is what enables requester capture (request id, user agent, salted
+    # client hash). Omit it and the API records answers without any caller identity.
+    settings=_SETTINGS,
 )
 # Restrict CORS to the deployed WEB project's Vercel domains (production aliases + preview URLs),
 # rather than a blanket "*". The API holds no secrets in responses, but this is good hygiene.
