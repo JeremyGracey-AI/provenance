@@ -754,7 +754,10 @@ def _nul_violations(node: object, where: str, path: str = "") -> list[Violation]
                     # verifier that crashes instead of reporting.
                     f"contains U+0000 at index {node.find(NUL)} ({_excerpt(node)}) — "
                     f"PostgreSQL text/jsonb cannot represent a NUL, so this record cannot be "
-                    f"stored; the door refuses it at 422 (api/app.py)",
+                    f"stored. Only `question` has a door: `QueryRequest` rejects a NUL query "
+                    f"at 422 (api/app.py). Model-supplied strings (`answer`, `claims[].text`, "
+                    f"`claims[].evidence`) and operator-supplied `model` have NO door, so this "
+                    f"violation is reachable at an HTTP 200 — see WEEK-4 `## Next`",
                 )
             )
     elif isinstance(node, dict):
