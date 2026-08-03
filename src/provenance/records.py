@@ -73,6 +73,11 @@ record is schema-complete AND internally consistent:
       citations resolve),
   (g) `retrieved` holds DISTINCT page ids: one page retrieved once. Rule (f) alone left the
       padding attack open at a smaller size — k copies of the one cited page satisfies it.
+Schema completeness also refuses U+0000 anywhere in the record — any string, at any depth,
+values and object keys alike (`_nul_violations`, and `is_nul_free` for the predicate). The
+door refuses it too, in the SAME commit: `api/app.py` rejects a query carrying a NUL with
+422, so this rule cannot be reached by a 200 (2026-08-03 invigilation defect 13, `[human]`
+ruling 6).
 Schema completeness also rejects VACUOUS records (finding 9): question and model must be
 non-empty, `k >= 1`, and `timestamp` must actually PARSE as ISO 8601 — it was previously
 type-checked only, so `timestamp: "tuesday-ish"` passed. An all-empty record used to verify
@@ -220,6 +225,59 @@ def is_present(value: str | None) -> bool:
     return bool(value and value.strip())
 
 
+NUL = "\x00"
+
+
+def is_nul_free(value: str | None) -> bool:
+    """The ONE definition of "the store can represent this string". Builder, verifier, door.
+
+    A SECOND predicate rather than a clause inside `is_present`, deliberately. `is_present`
+    answers "does this field say anything"; this answers "can this field be stored at all",
+    and they have different dispositions at the door (a blank query and a NUL-bearing query
+    are two different 422s) and different remedies for an optional field. Folding them would
+    also break the mutation property `is_present`'s docstring advertises — monkey-patching one
+    predicate must flip exactly one rule on both sides.
+
+    Why U+0000 and NOTHING ELSE (2026-08-03 invigilation defect 13, `[human]` ruling 6):
+    PostgreSQL `text` and `jsonb` cannot represent U+0000 — it is the one code point the store
+    named in `docs/records-schema.sql` cannot hold — so a record carrying one would be accepted
+    by the API, written to the day-file, verified green, and then SILENTLY fail to land,
+    invisible because `HttpSink` is fail-open. Every other C0 control character is storable and
+    is left alone on purpose: `\\n` and `\\t` are legitimate content in a question, and
+    `json.dumps` escapes every code point below 0x20 even with `ensure_ascii=False`, so unlike
+    U+2028 (see `_read_record_lines`) they create no reader-side hazard either. A wider rule
+    would be a restriction with no driver behind it, and every character the door refuses is a
+    question some caller cannot ask.
+
+    Stated at exactly its size, because the driver is documented and not executed: NOBODY HAS
+    RUN THAT DDL against any PostgreSQL (`docs/records-schema.sql:3`). "Postgres cannot store
+    U+0000" is a reasoned constraint, not a measured one. The ruling stands anyway — a NUL in a
+    question is not a thing a caller needs, and refusing it costs nothing.
+
+    None is nul-free: this decides only whether a value that EXISTS is representable.
+    """
+    return NUL not in (value or "")
+
+
+def _record_safe(value: str | None) -> bool:
+    """Keep this OPTIONAL string in a record? It must say something AND be storable.
+
+    One expression, called from both places an optional requester field is filtered
+    (`requester_context` binds, `build_record` copies), so the two cannot drift apart.
+
+    The asymmetry with `question` is the same one `is_present`'s docstring draws: a required
+    field with nothing to drop must be refused at the door (422), while an optional field is
+    simply dropped and the record does not claim to know that thing. `user_agent` is the case
+    that matters here — it is a header, and a NUL in a header value is rejected by h11 on a
+    real socket but NOT by `TestClient`, which parses nothing. That h11 claim is exactly the
+    kind of dependency behaviour this repo has been burned by assuming (the Day-1 gate's OWS
+    lesson runs the other way), and it cannot be tested here without a socket. So the record
+    does not rest on it: a NUL-bearing user agent is dropped like a blank one, and the
+    verifier's rule below is then unreachable from a 200 by this path too.
+    """
+    return is_present(value) and is_nul_free(value)
+
+
 def hash_client(address: str | None, *, salt: str) -> str | None:
     """Salted SHA-256 of a client address. The ONLY form in which it is ever stored.
 
@@ -260,7 +318,7 @@ def requester_context(
         "user_agent": user_agent,
         "client_hash": client_hash,
     }
-    present = {key: value for key, value in fields.items() if is_present(value)}
+    present = {key: value for key, value in fields.items() if _record_safe(value)}
     token = _REQUESTER.set(present or None)
     try:
         yield
@@ -321,7 +379,7 @@ def build_record(
     requester = current_requester() or {}
     for field in REQUESTER_FIELDS:
         value = requester.get(field)
-        if is_present(value):
+        if _record_safe(value):
             record[field] = value
     return record
 
@@ -601,9 +659,68 @@ def _excerpt(value: object, limit: int = 64) -> str:
     return f"{text[:limit]}… ({len(text)} chars)"
 
 
+def _nul_violations(node: object, where: str, path: str = "") -> list[Violation]:
+    """Every string in a record, at any depth, checked for U+0000. Values AND object keys.
+
+    ANY string field, not just `question`, because the constraint belongs to the STORE and not
+    to one column: `docs/records-schema.sql` puts `retrieved`, `claims` and `trace` in `jsonb`,
+    and `jsonb` cannot hold a NUL any more than `text` can. A rule that checked only the fields
+    a caller reaches today would pass a record the store still cannot accept.
+
+    The walk is the whole record rather than a list of known fields, on purpose: an unknown
+    extra key is not rejected here (nothing in this verifier has ever rejected extra fields),
+    but if it carries a NUL the row still fails to land, so it is still worth naming.
+
+    The reported path is the field name, and a key that itself carries a NUL is reported with
+    `repr` in the path segment — a violation line is output, and interpolating a raw control
+    character into it is the log-forgery shape `_log_token` exists to prevent one layer down.
+    """
+    out: list[Violation] = []
+    if isinstance(node, str):
+        if not is_nul_free(node):
+            out.append(
+                Violation(
+                    where,
+                    path or "<record>",
+                    # `find`, never `index`: this message must be derivable for ANY string the
+                    # predicate rejects, including under the mutation test that inverts
+                    # `is_nul_free` (where there is no NUL to point at and `index` would raise
+                    # ValueError out of a reporting path). A reporting path that can throw is a
+                    # verifier that crashes instead of reporting.
+                    f"contains U+0000 at index {node.find(NUL)} ({_excerpt(node)}) — "
+                    f"PostgreSQL text/jsonb cannot represent a NUL, so this record cannot be "
+                    f"stored; the door refuses it at 422 (api/app.py)",
+                )
+            )
+    elif isinstance(node, dict):
+        for key, value in node.items():
+            segment = key if isinstance(key, str) and is_nul_free(key) else repr(key)
+            child = f"{path}.{segment}" if path else str(segment)
+            if isinstance(key, str) and not is_nul_free(key):
+                out.append(
+                    Violation(
+                        where,
+                        child,
+                        f"object KEY {_excerpt(key)} contains U+0000 — PostgreSQL text/jsonb "
+                        f"cannot represent a NUL, so this record cannot be stored",
+                    )
+                )
+            out.extend(_nul_violations(value, where, child))
+    elif isinstance(node, list):
+        for i, item in enumerate(node):
+            out.extend(_nul_violations(item, where, f"{path}[{i}]" if path else f"<record>[{i}]"))
+    return out
+
+
 def _schema_violations(rec: dict, where: str) -> list[Violation]:
     """Schema completeness: every field present with the right shape. Returns [] when clean."""
     out: list[Violation] = []
+
+    # U+0000, anywhere in the record. A schema violation rather than a consistency one because
+    # a record that cannot be stored is malformed, not merely inconsistent — and because
+    # `verify_paths` skips the consistency pass once the schema fails, which is the right
+    # order: there is nothing useful to recompute about a row that can never land.
+    out.extend(_nul_violations(rec, where))
 
     def expect(container: dict, field: str, types: tuple, label: str, allow_bool: bool = False):
         if field not in container:

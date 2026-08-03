@@ -20,6 +20,12 @@ a module attribute at call time, so the predicate cannot fork. The claim that bu
 exactly its size: **a 200 can never produce a record that fails the verifier's `is_present`
 rules for `question` or `user_agent`.**
 
+A second predicate now sits beside it in exactly the same shape — `records.is_nul_free`
+(`_no_nul`), refusing U+0000 in a query with 422 while `--verify` refuses U+0000 in ANY record
+string. Both halves shipped in one commit by `[human]` ruling 6: the verifier rule alone would
+have re-created the fork the paragraph above is about, a 200 producing a record its own
+verifier rejects.
+
 It is NOT true that a 200 can never leave behind a record its own verifier rejects. That larger
 sentence stood here until 2026-08-02 and a gate refuted it by command; one refutation is closed
 and one is open, and both are named rather than implied:
@@ -83,8 +89,44 @@ def _non_blank(value: str) -> str:
     return value
 
 
+def _no_nul(value: str) -> str:
+    """Reject a query carrying U+0000 — the door half of `[human]` ruling 6 (defect 13).
+
+    Today's behaviour without it: `{"query": "a\\x00b"}` is HTTP 200 (`is_present` is true —
+    NUL is not whitespace, so `.strip()` keeps it), the record is written with the NUL escaped
+    as `\\u0000` in JSON, and `--verify` exits 0. PostgreSQL `text`/`jsonb` cannot represent
+    U+0000, so that row would silently fail to land — and `HttpSink` is fail-open, so the loss
+    is invisible: no error to the caller, one stderr line at most, a store that is quietly
+    missing rows nobody can enumerate.
+
+    Written exactly like `_non_blank` above: a SEPARATE `AfterValidator` calling a SHARED
+    predicate from `records` (`records.is_nul_free`), resolved as a module attribute at call
+    time so the door and `records._nul_violations` cannot fork. Spelling `"\\x00" in value`
+    here instead would rebuild the two-definitions defect that `is_present` was made a
+    function to close, in the module that exists to prevent it.
+
+    Separate from `_non_blank` rather than folded into it because they are different rejections
+    with different messages, and because an optional field's remedy for the two differs (a
+    blank user agent is dropped; a NUL-bearing one is dropped too, but by
+    `records._record_safe`, which is where the two predicates meet for an optional field).
+
+    Scope, stated because narrowness is the design and not an oversight: U+0000 ONLY. Every
+    other C0 control character is storable, `\\n` and `\\t` are legitimate in a question, and
+    `json.dumps` escapes all of them, so the verifier refuses exactly this one code point too —
+    door and verifier agree by construction, on the same predicate.
+    """
+    if not records.is_nul_free(value):
+        raise ValueError("must not contain U+0000 (NUL) — the record store cannot represent it")
+    return value
+
+
 class QueryRequest(BaseModel):
-    query: Annotated[str, Field(min_length=1, max_length=2000), AfterValidator(_non_blank)]
+    query: Annotated[
+        str,
+        Field(min_length=1, max_length=2000),
+        AfterValidator(_non_blank),
+        AfterValidator(_no_nul),
+    ]
 
 
 def _request_id(request: Request) -> str:

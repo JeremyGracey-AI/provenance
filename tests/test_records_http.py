@@ -780,3 +780,100 @@ def test_a_question_carrying_a_unicode_line_break_is_answered_and_still_verifies
         if line.strip()
     ]
     assert [q.encode("utf-8") for q in stored] == [q.encode("utf-8") for q in questions]
+
+
+# ------------------------------------------------------------------------ U+0000 at the door
+#
+# 2026-08-03 invigilation defect 13, `[human]` ruling 6. A query carrying U+0000 was HTTP 200
+# (NUL is not whitespace, so `is_present` is true), the record was written with the NUL escaped
+# to a six-character `\u0000` by `json.dumps`, and `--verify` exited 0 — a record that verifies green and that
+# PostgreSQL `text`/`jsonb` CANNOT STORE. With a fail-open sink, that row's absence is
+# invisible: the caller sees 200, the store quietly never receives it.
+#
+# The ruling required both halves in one commit. These tests are the door half; the verifier
+# half is in `tests/test_records.py`, and the anti-fork test below is what ties them together.
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["\x00", "a\x00b", "What are the four tissue types?\x00", "\x00 padded"],
+    ids=["bare", "interior", "trailing", "leading"],
+)
+def test_a_query_containing_a_nul_is_refused_with_422_and_writes_no_record(query):
+    """422, in pydantic's shape, and nothing written — same contract as the blank query.
+
+    Every one of these is `is_present` TRUE: `"\\x00".strip()` is `"\\x00"`, because NUL is not
+    whitespace in Python. That is exactly why this needed a SECOND predicate rather than a
+    tweak to the first — the two rules disagree about this string, and both are right about
+    their own question.
+
+    Reachable over a real socket, not only in-process: `query` rides in a JSON body, where
+    `\\u0000` is a legal escape and the raw byte is legal UTF-8. No HTTP parser stands between
+    a caller and this field (the Day-1 gate's h11 lesson is about HEADERS)."""
+    sink = CaptureSink()
+    client = _client(sink, settings=_settings(client_hash_salt="fixed-test-salt"))
+    response = client.post("/query", json={"query": query}, headers={"user-agent": "pytest-ua/1.0"})
+
+    assert response.status_code == 422
+    assert sink.records == []
+    # The same `loc` the blank rejection beside it produces: the contract is "which field",
+    # not a version-coupled message string.
+    blank_loc = client.post("/query", json={"query": " "}).json()["detail"][0]["loc"]
+    assert response.json()["detail"][0]["loc"] == blank_loc == ["body", "query"]
+    assert sink.records == []
+
+
+def test_the_nul_predicate_cannot_fork_between_the_door_and_the_verifier(tmp_path, monkeypatch):
+    """The anti-fork property, MUTATION-CHECKED rather than asserted — as `is_present` is.
+
+    Both sides resolve `records.is_nul_free` as a module attribute at call time, so patching
+    the one function flips the one rule in both places at once. If `api/app.py` had spelled
+    `"\\x00" in value` itself, the door below would keep returning 200 while the verifier
+    changed its mind — which is precisely the fork this repo has already shipped once and the
+    reason the ruling required both halves in a single commit.
+
+    Inverted (everything is a NUL) rather than disabled, because a permissive patch proves
+    nothing: a door that never rejects and a verifier that never complains are indistinguishable
+    from no rule at all."""
+    sink = CaptureSink()
+    client = _client(sink, settings=_settings(client_hash_salt="fixed-test-salt"))
+    assert client.post("/query", json={"query": _Q}).status_code == 200  # control: clean today
+    clean_record = dict(sink.records[0])
+    path = tmp_path / "clean.jsonl"
+    path.write_text(json.dumps(clean_record) + "\n")
+    assert records.main(["--verify", str(path)]) == 0
+
+    monkeypatch.setattr(records, "is_nul_free", lambda value: False)
+    assert client.post("/query", json={"query": _Q}).status_code == 422  # the door moved
+    assert records.main(["--verify", str(path)]) == 1  # ...and so did the verifier
+
+
+def test_a_user_agent_carrying_a_nul_is_dropped_not_written(tmp_path):
+    """The optional field's remedy, and the reason it is a DROP and not a 422.
+
+    `question` is required, so a NUL there has to be refused at the door. `user_agent` is
+    optional, so the record simply does not claim to know it — the same asymmetry `is_present`
+    already draws for a blank value, applied through `records._record_safe`, which is the one
+    place the two predicates meet.
+
+    Not hypothetical in this process: `TestClient` parses no HTTP, so the header below reaches
+    the app with its NUL intact and — before this fix — landed in the record verbatim, giving a
+    200 whose record `--verify` now rejects. On a real socket h11 would refuse the header first,
+    but this repo does not rest a property on an untested claim about a dependency, so the
+    builder drops it either way."""
+    sink = CaptureSink()
+    client = _client(sink, settings=_settings(client_hash_salt="fixed-test-salt"))
+    response = client.post(
+        "/query",
+        json={"query": _Q},
+        headers={"user-agent": "Mozilla/5.0\x00evil", "x-forwarded-for": _ADDRESS},
+    )
+    assert response.status_code == 200
+
+    (record,) = sink.records
+    assert "user_agent" not in record  # dropped whole — never a stripped or escaped variant
+    assert len(record["request_id"]) == 32 and len(record["client_hash"]) == 64  # others intact
+
+    path = tmp_path / "nul-ua.jsonl"
+    path.write_text(json.dumps(record) + "\n")
+    assert records.main(["--verify", str(path)]) == 0

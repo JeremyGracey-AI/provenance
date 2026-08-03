@@ -359,6 +359,116 @@ def test_two_crafted_records_are_still_accepted_on_purpose(mutate, tmp_path):
     assert records.main(["--verify", str(path)]) == 0
 
 
+# --------------------------------------------------------------------------------------
+# U+0000 in a record — the verifier half of `[human]` ruling 6 (invigilation defect 13).
+# The door half (422, no record written) is in `tests/test_records_http.py`; they shipped in
+# one commit, because the verifier alone would have re-created the fork the whole `is_present`
+# story is about — a 200 that produces a record its own verifier rejects.
+#
+# The rule is the STORE's, not one column's: `docs/records-schema.sql` puts `retrieved`,
+# `claims` and `trace` in `jsonb`, which can no more hold a NUL than `text` can. So the walk
+# is the whole record, at any depth, values and object keys alike.
+# --------------------------------------------------------------------------------------
+
+
+_NUL_PLACEMENTS = {
+    "question": (lambda rec: {**rec, "question": "a\x00b"}, "field=question"),
+    "model": (lambda rec: {**rec, "model": "claude\x00"}, "field=model"),
+    "claim-text": (
+        lambda rec: {**rec, "claims": [{**rec["claims"][0], "text": "x\x00y"}, *rec["claims"][1:]]},
+        "field=claims[0].text",
+    ),
+    "claim-citation": (
+        lambda rec: {
+            **rec,
+            "claims": [
+                {**rec["claims"][0], "citations": [rec["claims"][0]["citations"][0] + "\x00"]},
+                *rec["claims"][1:],
+            ],
+        },
+        "field=claims[0].citations[0]",
+    ),
+    "retrieved-id": (
+        lambda rec: {**rec, "retrieved": [{**rec["retrieved"][0], "id": "p\x00"}, *rec["retrieved"][1:]]},
+        "field=retrieved[0].id",
+    ),
+    "trace-detail-value": (
+        lambda rec: {
+            **rec,
+            "trace": [{**rec["trace"][0], "detail": {"note": "s\x00"}}, *rec["trace"][1:]],
+        },
+        "field=trace[0].detail.note",
+    ),
+    "trace-detail-key": (
+        lambda rec: {**rec, "trace": [{**rec["trace"][0], "detail": {"k\x00": 1}}, *rec["trace"][1:]]},
+        "object KEY",
+    ),
+    "unknown-extra-field": (
+        lambda rec: {**rec, "note_from_some_other_writer": "z\x00"},
+        "field=note_from_some_other_writer",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "mutate, needle", list(_NUL_PLACEMENTS.values()), ids=list(_NUL_PLACEMENTS)
+)
+def test_verify_rejects_a_nul_anywhere_in_a_record(mutate, needle, tmp_path, capsys):
+    """One code point, eight places, each named by its own path.
+
+    `unknown-extra-field` is the one that states the design: this verifier has never rejected
+    extra fields and still does not, but a NUL inside one is still a row that cannot land, so
+    the walk covers the record rather than a list of known columns. `trace-detail-key` is the
+    other: a NUL can arrive as an object KEY, and `jsonb` cannot hold that either.
+
+    Every mutation starts from a record the demo pipeline really wrote and changes ONE string,
+    so the rejection can only be caused by the thing changed."""
+    _, _, recs = _run_demo_with_sink(tmp_path / "src")
+    path = _write(tmp_path, mutate(recs[0]), "nul.jsonl")
+
+    assert records.main(["--verify", str(path)]) == 1
+    out = capsys.readouterr().out
+    assert needle in out
+    assert "U+0000" in out
+
+
+def test_the_nul_rule_leaves_every_other_control_character_alone(tmp_path):
+    """Narrow ON PURPOSE, and pinned so the narrowness is a decision rather than an oversight.
+
+    The ruling's driver is one sentence: PostgreSQL `text`/`jsonb` cannot represent U+0000.
+    Every other C0 control character IS storable, `\\n` and `\\t` are legitimate content in a
+    question, and `json.dumps` escapes all of them even with `ensure_ascii=False` — so unlike
+    U+2028 they create no reader-side hazard either (`_read_record_lines`). Widening would ship
+    a restriction with no driver, and each character refused is a question nobody can ask.
+
+    Asserted through the real CLI on a real record, with the round trip, because "it verifies"
+    and "it survives the file" are two claims and only the second is about the writer."""
+    others = "\t\n\r\x01\x1b\x1c\x7f"
+    _, path, recs = _run_demo_with_sink(tmp_path / "src", f"a{others}b")
+    assert recs[0]["question"] == f"a{others}b"
+    assert records.main(["--verify", str(path)]) == 0
+    assert all(records.is_nul_free(ch) for ch in others)
+    assert not records.is_nul_free("\x00")
+
+
+def test_a_nul_bearing_record_fails_before_the_consistency_pass(tmp_path, capsys):
+    """A record that cannot be stored is malformed, not merely inconsistent.
+
+    The NUL rule is a SCHEMA violation, so `verify_paths` skips the consistency recompute for
+    that record — the same order every other schema failure follows. Pinned because the
+    alternative (consistency first, or both) would print two violations for one defect and make
+    the count in the summary line depend on which rules happen to overlap."""
+    _, _, recs = _run_demo_with_sink(tmp_path / "src")
+    rec = {**recs[0], "question": "a\x00b", "confidence": 0.25}  # NUL *and* a tampered confidence
+    path = _write(tmp_path, rec, "nul-and-tampered.jsonl")
+
+    assert records.main(["--verify", str(path)]) == 1
+    out = capsys.readouterr().out
+    assert "field=question" in out and "U+0000" in out
+    assert "field=confidence" not in out  # the consistency pass did not run
+    assert "1 violation(s)" in out
+
+
 def test_a_non_utf8_file_is_one_violation_and_does_not_mask_tampering(tmp_path, capsys):
     """2026-08-03 invigilation, defect 4: one corrupt file used to abort the WHOLE run.
 
