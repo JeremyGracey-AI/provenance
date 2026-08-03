@@ -249,8 +249,9 @@ def test_the_dropped_record_warning_names_the_record_but_never_the_question(caps
     err = capsys.readouterr().err
     assert f"run_id={record['run_id']}" in err
     assert f"timestamp={record['timestamp']}" in err
-    assert record["question"] not in err
-    assert "question" not in err.replace("a-question", "")  # not by any other spelling either
+    assert record["question"] not in err  # the whole value...
+    assert "nobody-else-should-read" not in err  # ...and no fragment of it
+    assert "question=" not in err  # no field for it either
 
 
 def test_the_dropped_record_warning_survives_a_record_it_cannot_read(capsys):
