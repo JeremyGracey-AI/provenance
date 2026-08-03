@@ -121,6 +121,11 @@ def test_http_sink_posts_the_full_record(tmp_path):
     settings = _settings()
     assert posted["record_version"] == records.RECORD_VERSION
     assert posted["question"] == answer.question == _Q
+    # v2 (`[human]` ruling 7): the durable path carries the served answer and the judge's
+    # evidence too. Asserted against the `GroundedAnswer` the caller got, so the two sinks and
+    # the response cannot drift into three stories.
+    assert posted["answer"] == answer.answer
+    assert [c["evidence"] for c in posted["claims"]] == [c.evidence for c in answer.claims]
     assert posted["model"] == settings.vlm_model
     assert posted["k"] == settings.top_k
     assert posted["confidence"] == answer.confidence

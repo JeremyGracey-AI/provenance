@@ -12,6 +12,14 @@
 -- the human's call (WEEK-4.md Workstream A Day 2); this file exists so that call is one
 -- paste, not a design session.
 --
+-- 2026-08-03, `[human]` ruling 7: this file now describes record_version 2 — a required
+-- `answer` column and an `evidence` key inside `claims`. That changes nothing about the
+-- paragraph above. Still nobody has run it, and the new column is as untested as the old ones.
+-- One consequence of `if not exists` worth knowing before pasting: if a table by this name
+-- ALREADY existed anywhere, this statement would silently do nothing rather than add `answer`.
+-- Adding the column to a live table is an `alter table ... add column answer text` plus a
+-- decision about what to put in the existing rows, and that is a human's call, not a paste.
+--
 -- Column names are EXACTLY the JSON keys that `src/provenance/records.py:build_record`
 -- emits, because PostgREST maps a posted JSON object to columns by name. Renaming a column
 -- here silently drops that field on insert.
@@ -41,15 +49,46 @@ create table if not exists public.answer_records (
     -- constraint that fails to parse breaks the whole paste.
     run_id            text primary key,
 
+    -- This table is shaped for record_version 2 (`[human]` ruling 7, 2026-08-03), which is
+    -- what `build_record` writes. Named because it has a consequence: a v1 record — anything
+    -- written before 2026-08-03, including `records/answers/answers-2026-08-02.jsonl` in this
+    -- repository — has no `answer` and CANNOT be inserted here; the not-null below would
+    -- reject it. `--verify` still reads v1 (it dispatches on the version); this table does
+    -- not. Backfilling one means deciding what `answer` should say for a run whose answer was
+    -- never recorded, which is a human's call and not a default.
     record_version    integer          not null,
     -- Quoted because `timestamp` is a type name in Postgres. It must keep this name: it is
     -- the JSON key, and JsonlSink's day-file naming derives from it.
     "timestamp"       timestamptz      not null,
     question          text             not null,
+    -- The prose SERVED to the caller (`GroundedAnswer.answer`), new and REQUIRED at v2. Without
+    -- it a row could satisfy every check in this file and every check in `--verify` while the
+    -- caller had been told something the claims never said (2026-08-03 invigilation, defect 3).
+    --
+    -- READ THIS BEFORE GRANTING ANYONE SELECT ON THIS TABLE. It is the most disclosive column
+    -- here and it changes the table's privacy profile, which is an accepted cost of the ruling
+    -- and not an oversight: `question` is caller-authored text, but `answer` is MODEL OUTPUT
+    -- OVER CALLER-CHOSEN QUESTIONS — longer, more specific, and capable of restating whatever
+    -- a caller put in the question plus whatever the corpus says about it. A medical question
+    -- and its answer, side by side, keyed by `client_hash`, is a materially different data set
+    -- from a list of questions. The key that reaches it is service_role (see the RLS note at
+    -- the bottom), so "who can read this" is exactly "who has that secret".
+    --
+    -- Rows also get bigger: this is the largest field in a record, and unbounded — `--verify`
+    -- caps nothing here, on purpose (a cap in the verifier that the writer does not share is
+    -- the fork `records.py:is_present` exists to prevent).
+    --
+    -- NOT NULL but NOT non-blank: `HostedVLM.answer` uses `payload.get("answer", "")`
+    -- (src/provenance/backends/vlm.py:170), so an empty answer is a real 200, and a CHECK
+    -- rejecting it here would refuse a row the API can legitimately produce.
+    answer            text             not null,
     model             text             not null,
     k                 integer          not null check (k >= 1),
     retrieved         jsonb            not null,   -- [{id, score}] in retrieval order
-    claims            jsonb            not null,   -- [{text, citations, verdict, verify_fallback}]
+    -- [{text, citations, verdict, verify_fallback, evidence}] — `evidence` is the span the
+    -- judge quoted off the page (v2; "" for an unsupported claim, which is a value and not an
+    -- absence). Before v2 the record carried the verdict without the reason for it.
+    claims            jsonb            not null,
     confidence        double precision not null check (confidence >= 0 and confidence <= 1),
     repairs           integer          not null check (repairs >= 0),
     trace             jsonb            not null,   -- [{name, duration_ms, detail, started_at}]
@@ -116,8 +155,16 @@ create index if not exists answer_records_client_hash_idx on public.answer_recor
 -- service_role key bypasses RLS and is the only thing that works. Consequence, stated so it
 -- is a decision and not an accident: PROVENANCE_RECORDS_KEY is a service_role secret. It
 -- belongs in the API project's env only — never in a NEXT_PUBLIC_* var, never in web/.
+--
+-- That sentence carries more weight since v2 added `answer`. This table now holds, per row,
+-- what an anonymous caller asked AND what the system told them, grouped by a stable
+-- per-caller digest. Anyone holding the service_role key can read all of it; nothing here
+-- redacts, samples, or expires. Retention is unset by design — naming it is a policy decision
+-- this file is not authorised to take, so it is stated as a gap rather than defaulted.
 alter table public.answer_records enable row level security;
 
 -- Verify what landed (Day 2's `--verify` does the real consistency checks):
 --   select run_id, "timestamp", question, confidence, request_id, client_hash
 --   from public.answer_records order by "timestamp" desc limit 20;
+-- `answer` is deliberately NOT in that select list: it is the disclosive column, and a
+-- did-the-insert-work check does not need it. Read it when you mean to.

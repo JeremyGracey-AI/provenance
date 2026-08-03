@@ -5,19 +5,24 @@ retrieved pages, verified claims, confidence, and the trace at once — and hand
 composed at `Pipeline` construction. A sink failure never breaks an answer (stderr warning
 only), and `record_sink=None` (the default everywhere) means records are off.
 
-Record schema, `record_version` 1 — one JSON object per line:
+Record schema, `record_version` 2 — one JSON object per line:
 
     record_version   int      schema version (this file is its source of truth)
     run_id           str      uuid4 hex, unique per run
     timestamp        str      ISO 8601 with UTC offset, local time at record build
     question         str      the query as passed to `Pipeline.run`
+    answer           str      the prose SERVED to the caller — `GroundedAnswer.answer`.
+                              NEW IN v2 and REQUIRED (see the version note below)
     model            str      `Settings.vlm_model`
     k                int      `Settings.top_k`
     retrieved        list     [{id, score}] in retrieval order
-    claims           list     [{text, citations, verdict, verify_fallback}]
+    claims           list     [{text, citations, verdict, verify_fallback, evidence}]
                               verify_fallback: True iff none of the claim's citations matched
                               a retrieved page id, so the judge saw ALL retrieved pages
                               (graph.py's `or state["pages"]` branch) — previously invisible
+                              evidence: `VerifiedClaim.evidence`, the span the judge quoted
+                              off the page. NEW IN v2, required, and legitimately EMPTY for an
+                              unsupported claim (models.py:53; vlm.py:181 forces "")
     confidence       float    as computed by the verify node: supported / len(claims)
                               (0.0 when no claims; no rounding)
     repairs          int      repair loop iterations taken
@@ -39,15 +44,46 @@ Each of the three is dropped when it is missing OR whitespace-only — one predi
 `is_present`, shared with the verifier, so "present" cannot mean two things (see its
 docstring for the defect that made it a function).
 
-`record_version` stays **1**. These three are optional ADDITIONS: a v1 record without them
-is still valid, a record with them is a superset, and the verifier below checks them only
-`if present`. Bumping the version would buy nothing and would force version dispatch into
-`--verify`, which must keep reading the records already on disk.
+The three requester fields are optional ADDITIONS at any version: a record without them is
+still valid, a record with them is a superset, and the verifier below checks them only
+`if present`. They needed no version bump — `answer` did.
+
+VERSIONS, AND WHY THERE ARE NOW TWO. This paragraph said `record_version` stays **1**, on the
+grounds that a bump "would force version dispatch into `--verify`, which must keep reading the
+records already on disk". The second half of that sentence was right and is now a REQUIREMENT
+rather than a reason to avoid the field (`[human]` ruling 7, 2026-08-03): `answer` is required,
+so it is a new schema, so the version moves, so `--verify` dispatches.
+
+    v1  question, claims [{text, citations, verdict, verify_fallback}], no answer.
+        Records written before 2026-08-03. `records/answers/answers-2026-08-02.jsonl` in this
+        repository is one, and it MUST keep verifying — that file is the regression gate.
+    v2  adds `answer` (required) and `claims[].evidence` (required). What `build_record`
+        writes today; `RECORD_VERSION` is the one place that number lives.
+
+`_schema_violations` therefore checks MEMBERSHIP in `_SUPPORTED_RECORD_VERSIONS`, not equality
+with `RECORD_VERSION` (fix cycle 1 added the equality rule; the ruling required it to become
+version-aware). Per-version requirements are then applied by version. Reading a v1 record is
+not a courtesy: a verifier that rejected the records it wrote last week would be a verifier
+nobody can point at a store. Nothing is rejected for carrying EXTRA fields, at either version.
+
+WHAT `answer` BUYS, AT EXACTLY ITS SIZE. A record used to carry question, claims, citations and
+confidence but not the answer served, so it could verify perfectly clean while the caller was
+told something the claims never said — demonstrated by the 2026-08-03 invigilation (defect 3)
+with "Osmosis is a French pastry. Do not drink water." plus one correctly-cited supported claim,
+`--verify` exit 0. With `answer` in the record, that contradiction is IN THE ARTIFACT: a human
+reading one record can see it, and the week's deliverable becomes falsifiable by inspection.
+It is NOT machine-checkable and `--verify` does not pretend otherwise — it checks that the
+field is present and a string, never that the prose is true, and never any semantic relation
+between the answer and the claims. The same crafted record still exits 0 today; what changed is
+that a reader can now refute it.
 
 Named gap — raw_citations: not captured, vlm coercion discards — gap. `HostedVLM.answer`
 coerces model-emitted citations via `_resolve_citation` (backends/vlm.py:105-122) and drops
 the original string; threading it here would add fields to `Claim` AND `VerifiedClaim` (the
-API-facing answer schema) plus both judge implementations, which is not a cheap thread.
+API-facing answer schema) plus both judge implementations, which is not a cheap thread. This
+was the ONLY gap named here until 2026-08-03, when the invigilation pointed out that `answer`
+and `evidence` were undisclosed omissions rather than declared ones; both are closed above, and
+this one is what is left.
 
 Verification (`python -m provenance.records --verify <file-or-dir>`) exits 0 iff every
 record is schema-complete AND internally consistent:
@@ -85,8 +121,10 @@ green, in a module that rejects an empty record *set* for exactly that reason.
 
 The 2026-08-03 invigilation (defect 12) crafted thirteen records and this verifier blessed
 twelve. What it now also refuses, each rule against a named crafted record:
-  * `record_version` must EQUAL `RECORD_VERSION`. It was defined and never compared, so
-    `99` and `-1` both passed — a record announcing a schema this file does not implement.
+  * `record_version` must be one this file IMPLEMENTS (`_SUPPORTED_RECORD_VERSIONS`). It was
+    defined and never compared, so `99` and `-1` both passed — a record announcing a schema
+    this file does not implement. (Fix cycle 1 wrote this as equality with `RECORD_VERSION`;
+    ruling 7's bump to v2 made it membership, so a v1 record on disk still verifies.)
   * `run_id` must be 32 lowercase hex digits, as `build_record` mints and this schema
     documents. `"../../etc/passwd"` was a valid run_id. (Hygiene, not a traversal fix:
     nothing here builds a path from it.)
@@ -140,7 +178,15 @@ if TYPE_CHECKING:
     from provenance.models import GroundedAnswer
     from provenance.tracing import Trace
 
-RECORD_VERSION = 1
+RECORD_VERSION = 2
+
+# Every schema `--verify` can read, not just the one `build_record` writes. The distinction is
+# the whole of `[human]` ruling 7's back-compat constraint: v1 records exist on disk (this
+# repository ships one at `records/answers/answers-2026-08-02.jsonl`) and predate `answer`, so
+# the verifier dispatches on this tuple instead of comparing to `RECORD_VERSION`. Removing 1
+# from it is how you break every record written before 2026-08-03 — that is what the version
+# dispatch test asserts, by mutation.
+_SUPPORTED_RECORD_VERSIONS = (1, 2)
 
 _VERDICTS = ("supported", "unsupported")
 
@@ -341,7 +387,19 @@ def build_record(
     trace: "Trace",
     verify_fallbacks: list[bool],
 ) -> dict:
-    """Assemble a record_version-1 dict from the state `Pipeline.run` already holds."""
+    """Assemble a `RECORD_VERSION` dict from the state `Pipeline.run` already holds.
+
+    v2 adds two fields that were being dropped on the floor (`[human]` ruling 7):
+
+    * `answer` — `GroundedAnswer.answer`, the prose the caller was actually served. Without it
+      a record could verify clean while the answer contradicted its own claims.
+    * `claims[].evidence` — `VerifiedClaim.evidence`, the span the judge quoted off the page.
+      Every field of a `VerifiedClaim` except this one was already recorded, so the record held
+      the judge's verdict without the judge's reason.
+
+    Both come from the `GroundedAnswer` this function is already handed; nothing new is
+    computed here and `Pipeline.run`'s signature is untouched.
+    """
     flags = list(verify_fallbacks)
     claims = []
     for i, claim in enumerate(answer.claims):
@@ -351,6 +409,10 @@ def build_record(
                 "citations": list(claim.citations),
                 "verdict": claim.verdict,
                 "verify_fallback": bool(flags[i]) if i < len(flags) else False,
+                # Verbatim, INCLUDING the empty string an unsupported claim carries
+                # (models.py:53, and vlm.py:181 forces "" for an unsupported verdict). Empty is
+                # a real value here, not an absence, so it is written rather than dropped.
+                "evidence": claim.evidence,
             }
         )
     record = {
@@ -358,6 +420,9 @@ def build_record(
         "run_id": uuid.uuid4().hex,
         "timestamp": datetime.now().astimezone().isoformat(),
         "question": answer.question,
+        # The served prose, verbatim. `question` is what was asked and this is what was said;
+        # a record with only the first documents half a decision (invigilation defect 3).
+        "answer": answer.answer,
         "model": settings.vlm_model,
         "k": settings.top_k,
         "retrieved": [{"id": page.id, "score": page.score} for page in answer.retrieved],
@@ -747,13 +812,15 @@ def _schema_violations(rec: dict, where: str) -> list[Violation]:
     # read as though it did: the fields would be interpreted under the wrong contract, which
     # is the entire reason the field exists.
     version = expect(rec, "record_version", (int,), "record_version")
-    if version is not None and version != RECORD_VERSION:
+    if version is not None and version not in _SUPPORTED_RECORD_VERSIONS:
         out.append(
             Violation(
                 where,
                 "record_version",
-                f"{version} != {RECORD_VERSION} — this verifier implements record_version "
-                f"{RECORD_VERSION} only and will not interpret another schema's fields",
+                f"{version} is not a schema this verifier implements (supported: "
+                f"{', '.join(str(v) for v in _SUPPORTED_RECORD_VERSIONS)}; this build writes "
+                f"{RECORD_VERSION}) — a record's fields must not be read under another "
+                f"schema's contract",
             )
         )
 
@@ -815,6 +882,21 @@ def _schema_violations(rec: dict, where: str) -> list[Violation]:
         value = expect(rec, field, (str,), field)
         if value is not None and not is_present(value):
             out.append(Violation(where, field, "empty — a record with no {} documents nothing".format(field)))
+
+    # v2 ONLY: the answer served. Required from v2 on, absent from v1 by definition — this is
+    # the version dispatch `[human]` ruling 7 called for, and the reason a v1 record on disk
+    # still verifies (`records/answers/answers-2026-08-02.jsonl`).
+    #
+    # Presence and type, and DELIBERATELY NOT `is_present`. A blank answer is a real outcome of
+    # this pipeline: `HostedVLM.answer` builds `Answer(text=payload.get("answer", ""), ...)`
+    # (backends/vlm.py:170), so a model that calls the tool without filling that key yields a
+    # 200 whose answer is "". Requiring non-blank here would make that 200 produce a record
+    # this verifier rejects — the exact fork `is_present` exists to prevent, and a second
+    # instance of the `model` defect this file already carries as open. If a blank answer
+    # should be impossible, the place to close it is the answerer or the door, not here; that
+    # is a product decision and it is stated rather than taken.
+    if version == 2:
+        expect(rec, "answer", (str,), "answer")
     k = expect(rec, "k", (int,), "k")
     if k is not None and k < 1:
         out.append(Violation(where, "k", f"{k} < 1 — a run retrieves at least one page"))
@@ -862,6 +944,18 @@ def _schema_violations(rec: dict, where: str) -> list[Violation]:
             if verdict is not None and verdict not in _VERDICTS:
                 out.append(Violation(where, f"claims[{i}].verdict", f"expected one of {_VERDICTS}, got {verdict!r}"))
             expect(claim, "verify_fallback", (bool,), f"claims[{i}].verify_fallback", allow_bool=True)
+            # v2 ONLY, same dispatch as `answer` above. Presence and type only:
+            #   * an UNSUPPORTED claim's evidence is legitimately "" — `vlm.py:181` forces it
+            #     and `models.py:53` documents it, so a non-blank rule would refuse records the
+            #     pipeline writes on every rejected claim;
+            #   * a SUPPORTED claim's evidence is `payload.get("evidence", "")` (vlm.py:181),
+            #     so it too can be "" at a 200 — same fork, same reason not to;
+            #   * and no rule ties evidence to the verdict. "unsupported implies empty" is a
+            #     convention of the two judges in this repo, not a property recomputable from
+            #     the record — rules (a)-(g) recompute from record DATA — and pinning it here
+            #     would forbid a future judge that explains why it rejected a claim.
+            if version == 2:
+                expect(claim, "evidence", (str,), f"claims[{i}].evidence")
 
     trace = expect(rec, "trace", (list,), "trace")
     if trace is not None:

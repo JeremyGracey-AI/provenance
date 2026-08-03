@@ -62,6 +62,250 @@ def test_end_to_end_record_schema_complete(tmp_path):
     assert all(isinstance(s["detail"], dict) for s in rec["trace"])
 
 
+def test_end_to_end_record_carries_the_answer_and_per_claim_evidence(tmp_path):
+    """`record_version` 2, `[human]` ruling 7: the record holds what the caller was SERVED.
+
+    Both fields come off the `GroundedAnswer` the pipeline already built, so the assertions
+    compare against `result`, never against a literal — a record that agreed with a hardcoded
+    string would prove the string, not the plumbing."""
+    result, _, recs = _run_demo_with_sink(tmp_path)
+    (rec,) = recs
+
+    assert rec["record_version"] == records.RECORD_VERSION == 2
+    assert rec["answer"] == result.answer
+    assert rec["answer"]  # the demo pipeline really says something
+    assert [c["evidence"] for c in rec["claims"]] == [c.evidence for c in result.claims]
+    assert rec["claims"][0]["evidence"] == "(scripted supporting span)"
+    assert records.main(["--verify", str(tmp_path)]) == 0
+
+
+def test_verify_rejects_a_v2_record_with_the_answer_removed(tmp_path, capsys):
+    """Required means required: a v2 record without `answer` is refused BY NAME.
+
+    This is the whole of why the ruling said v2-required rather than optional. Optional would
+    have left the hole open — a record could keep omitting the answer and keep verifying — so
+    "the record contains what was served" would be a habit rather than a property."""
+    _, _, recs = _run_demo_with_sink(tmp_path / "src")
+    rec = {k: v for k, v in recs[0].items() if k != "answer"}
+    path = _write(tmp_path, rec, "no-answer.jsonl")
+
+    assert records.main(["--verify", str(path)]) == 1
+    out = capsys.readouterr().out
+    assert "field=answer" in out and "missing" in out
+
+
+def test_verify_rejects_a_v2_claim_with_evidence_removed(tmp_path, capsys):
+    """The same rule one level down: every v2 claim carries the judge's span, or the record
+    is incomplete. `VerifiedClaim.evidence` was the one field of a verified claim that the
+    record dropped — the verdict without the reason for it."""
+    _, _, recs = _run_demo_with_sink(tmp_path / "src")
+    rec = dict(recs[0])
+    rec["claims"] = [{k: v for k, v in rec["claims"][0].items() if k != "evidence"}]
+    path = _write(tmp_path, rec, "no-evidence.jsonl")
+
+    assert records.main(["--verify", str(path)]) == 1
+    out = capsys.readouterr().out
+    assert "field=claims[0].evidence" in out and "missing" in out
+
+
+def test_an_empty_evidence_string_is_a_value_not_an_absence(tmp_path):
+    """An unsupported claim carries `evidence: ""` and that record must VERIFY.
+
+    `vlm.py:181` forces the empty string for an unsupported verdict and `models.py:53`
+    documents it, so a non-blank rule would refuse a record the pipeline writes every time the
+    judge rejects a claim. The repair loop is what produces one here: `simulate_repair` makes
+    the first attempt emit an ungrounded claim, so this runs the real path rather than editing
+    a field."""
+    from provenance.backends.fakes import ScriptedVLM
+
+    vlm = ScriptedVLM(simulate_repair=True)
+    pipeline = build_pipeline(
+        KeywordRouter(),
+        ScriptedRetriever.with_pages("anatomy-physiology-2e", [12, 134]),
+        vlm,
+        vlm,
+        Settings(),
+        JsonlSink(tmp_path),
+    )
+    result = pipeline.run("q")
+    assert result.repairs == 1  # the loop really ran
+    (path,) = sorted(tmp_path.glob("answers-*.jsonl"))
+    (line,) = [ln for ln in records._read_record_lines(path) if ln.strip()]
+    rec = json.loads(line)
+
+    assert all("evidence" in c for c in rec["claims"])
+    assert rec["claims"][0]["evidence"] == "(scripted supporting span)"
+    assert records.main(["--verify", str(path)]) == 0
+
+
+def test_a_blank_answer_is_recorded_and_verifies_on_purpose(tmp_path):
+    """The decision NOT to require a non-blank `answer`, pinned so it is visible.
+
+    `HostedVLM.answer` builds `Answer(text=payload.get("answer", ""), ...)`
+    (backends/vlm.py:170), so a model that calls the tool without filling that key produces a
+    200 whose answer is the empty string. An `is_present` rule on `answer` would then make that
+    200 leave behind a record `--verify` rejects — the fork `is_present` exists to prevent, and
+    a second instance of the `model` defect this repo already carries as OPEN.
+
+    So: presence and type, not content. Stated as a limit rather than a feature — a record with
+    a blank answer documents that the caller was served nothing, which is worth recording and
+    is not the verifier's to refuse. Closing it belongs at the answerer or the door."""
+
+    class BlankAnswerVLM:
+        def answer(self, query: str, pages: list[PageRef], feedback: str | None = None) -> Answer:
+            return Answer(
+                text="",  # the model called the tool and left `answer` empty
+                claims=[Claim(text="A claim with no prose around it.", citations=[pages[0].id])],
+            )
+
+        def verify(self, claim: Claim, pages: list[PageRef]) -> VerifiedClaim:
+            return VerifiedClaim(
+                text=claim.text, citations=claim.citations, verdict="supported", evidence="(span)"
+            )
+
+    vlm = BlankAnswerVLM()
+    pipeline = build_pipeline(
+        KeywordRouter(),
+        ScriptedRetriever.with_pages("anatomy-physiology-2e", [12, 134]),
+        vlm,
+        vlm,
+        Settings(),
+        JsonlSink(tmp_path),
+    )
+    result = pipeline.run("q")
+    assert result.answer == ""  # HTTP 200 would carry this
+    (path,) = sorted(tmp_path.glob("answers-*.jsonl"))
+    rec = json.loads([ln for ln in records._read_record_lines(path) if ln.strip()][0])
+    assert rec["answer"] == ""
+    assert records.main(["--verify", str(path)]) == 0
+
+
+# --------------------------------------------------------------------------------------
+# Version dispatch. The module docstring refused a version bump because "`--verify` must keep
+# reading the records already on disk" — `[human]` ruling 7 kept the constraint and made
+# dispatch the way to honour it. These are that constraint as tests.
+# --------------------------------------------------------------------------------------
+
+_REPO_V1_RECORD = Path(__file__).resolve().parents[1] / "records" / "answers" / "answers-2026-08-02.jsonl"
+
+
+def test_the_v1_record_committed_to_this_repository_still_verifies():
+    """THE regression gate for ruling 7, run against the real file rather than a fixture.
+
+    `records/answers/answers-2026-08-02.jsonl` was written on 2026-08-02 by a build that had no
+    `answer` field and no `record_version` but 1. If the version bump had been done as equality
+    (`record_version != RECORD_VERSION`), or the v2 requirements applied unconditionally, this
+    file — the only decision record this repository actually ships — would fail its own
+    verifier. Asserted through `records.main`, the CLI's own entry point."""
+    assert _REPO_V1_RECORD.exists(), _REPO_V1_RECORD
+    rec = json.loads([ln for ln in records._read_record_lines(_REPO_V1_RECORD) if ln.strip()][0])
+    assert rec["record_version"] == 1
+    assert "answer" not in rec  # it is genuinely a v1 record, not a v2 one relabelled
+    assert all("evidence" not in c for c in rec["claims"])
+
+    assert records.main(["--verify", str(_REPO_V1_RECORD)]) == 0
+
+
+def test_a_synthetic_v1_record_verifies_without_answer_or_evidence(tmp_path):
+    """The same property under this test's own control, so it survives that file being moved.
+
+    Built by DOWNGRADING a record the pipeline just wrote — drop `answer`, drop every claim's
+    `evidence`, set `record_version: 1` — which is exactly the shape v1 had."""
+    _, _, recs = _run_demo_with_sink(tmp_path / "src")
+    v1 = {k: v for k, v in recs[0].items() if k != "answer"}
+    v1["record_version"] = 1
+    v1["claims"] = [{k: v for k, v in c.items() if k != "evidence"} for c in v1["claims"]]
+
+    assert records.main(["--verify", str(_write(tmp_path, v1, "v1.jsonl"))]) == 0
+
+
+def test_a_v1_record_carrying_extra_fields_is_still_accepted(tmp_path):
+    """Version dispatch decides what is REQUIRED, never what is forbidden.
+
+    Nothing in this verifier has ever rejected an extra field, and adding that with the bump
+    would be new policy smuggled in beside a back-compat fix: a v1 record that happens to carry
+    `answer` (a v1 writer that recorded more than its schema demanded) is still a valid v1
+    record."""
+    _, _, recs = _run_demo_with_sink(tmp_path / "src")
+    v1 = dict(recs[0], record_version=1)  # keeps `answer` and every claim's `evidence`
+    assert records.main(["--verify", str(_write(tmp_path, v1, "v1-superset.jsonl"))]) == 0
+
+
+@pytest.mark.parametrize("version", [0, 3, 99, -1], ids=["zero", "next", "99", "negative"])
+def test_verify_refuses_a_version_it_does_not_implement(version, tmp_path, capsys):
+    """Membership, not equality — and still a closed set. `3` is the interesting one: it is
+    the version a FUTURE build will write, and reading it under v2's contract would interpret
+    fields this file has never seen."""
+    _, _, recs = _run_demo_with_sink(tmp_path / "src")
+    path = _write(tmp_path, {**recs[0], "record_version": version}, "future.jsonl")
+
+    assert records.main(["--verify", str(path)]) == 1
+    out = capsys.readouterr().out
+    assert "field=record_version" in out
+    assert "supported: 1, 2" in out
+
+
+def test_the_answer_does_not_make_a_contradiction_machine_checkable(tmp_path, capsys):
+    """The honest limit of ruling 7, asserted rather than promised — invigilation defect 3.
+
+    The invigilator's record was an answer reading "Osmosis is a French pastry. Do not drink
+    water." carried by a run whose single claim was correctly cited and supported. It verified
+    exit 0 then, and it verifies exit 0 NOW: `--verify` checks that `answer` is present and a
+    string, never that it is true, and never any relation between the prose and the claims.
+
+    What changed is the only thing the ruling claimed: the contradiction is IN the record, so a
+    human reading one line can see it. This test asserts both halves — the text is there, and
+    the verifier is still silent about it — so no later reader can mistake the field for a
+    check."""
+
+    class ContradictoryVLM:
+        def answer(self, query: str, pages: list[PageRef], feedback: str | None = None) -> Answer:
+            return Answer(
+                text="Osmosis is a French pastry. Do not drink water.",
+                claims=[
+                    Claim(
+                        text="Osmosis is the movement of water across a semipermeable membrane.",
+                        citations=[pages[0].id],
+                    )
+                ],
+            )
+
+        def verify(self, claim: Claim, pages: list[PageRef]) -> VerifiedClaim:
+            return VerifiedClaim(
+                text=claim.text,
+                citations=claim.citations,
+                verdict="supported",
+                evidence="water moves across a semipermeable membrane",
+            )
+
+    vlm = ContradictoryVLM()
+    pipeline = build_pipeline(
+        KeywordRouter(),
+        ScriptedRetriever.with_pages("anatomy-physiology-2e", [12, 134]),
+        vlm,
+        vlm,
+        Settings(),
+        JsonlSink(tmp_path),
+    )
+    result = pipeline.run("What is osmosis?")
+    assert result.confidence == 1.0  # every claim upheld: the arithmetic is honest
+
+    (path,) = sorted(tmp_path.glob("answers-*.jsonl"))
+    rec = json.loads([ln for ln in records._read_record_lines(path) if ln.strip()][0])
+
+    # WHAT THE FIELD BUYS: the served prose is in the artifact, so the contradiction between it
+    # and the claim is visible to a human reading this one record.
+    assert rec["answer"] == "Osmosis is a French pastry. Do not drink water."
+    assert "pastry" not in rec["claims"][0]["text"]
+    assert rec["claims"][0]["evidence"]  # and the judge's reason is there to check it against
+
+    # WHAT IT DOES NOT BUY: nothing here is machine-checkable, and `--verify` says so by
+    # exiting 0. Under v1 this record was clean because the answer was absent; under v2 it is
+    # clean because the answer is present and well-formed. Only a reader can refute it.
+    assert records.main(["--verify", str(path)]) == 0
+    assert "OK — 1 record(s)" in capsys.readouterr().out
+
+
 def test_jsonl_sink_appends_and_verify_passes(tmp_path):
     _run_demo_with_sink(tmp_path, "q one")
     _, path, recs = _run_demo_with_sink(tmp_path, "q two")
