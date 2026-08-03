@@ -145,8 +145,31 @@ def is_present(value: str | None) -> bool:
     `api/app.py:_non_blank` validates `QueryRequest.query` with this predicate. `question`
     is REQUIRED, so dropping it is not available — a blank one has to be refused at the door
     (422) instead. Same predicate, two dispositions, one definition of blank: that is the
-    point. Anything that returns 200 therefore satisfies the `question` rule below by
-    construction, not by two functions agreeing.
+    point.
+
+    THE GUARANTEE, AT EXACTLY ITS SIZE. What is proved is a statement about this predicate,
+    not about records in general: the door and the verifier both resolve `records.is_present`
+    as a module attribute at call time, so the two cannot fork, and **a 200 can never produce
+    a record that fails the verifier's `is_present` rules for `question` or `user_agent`.**
+    (Mutation-checked, not asserted: monkey-patching this function flips the door's decision
+    and the verifier's in the same process.)
+
+    What is NOT proved — and what this docstring claimed until 2026-08-02 — is that a 200 can
+    never leave a record `--verify` rejects. A gate refuted that sentence by command, and one
+    of the two refutations is still open:
+
+      * `model` is checked with `is_present` below and has NO door. `Settings.vlm_model` is
+        unconstrained (`config.py`) and `build_record` copies it into every record, so
+        `vlm_model=" "` is HTTP 200 and then `FAIL ... field=model — empty`. KNOWN AND OPEN,
+        stated as what it is: an OPERATOR-MISCONFIGURATION path, reachable only by whoever
+        controls the deployment's environment, never by a caller. Carried to Day 5 —
+        constraining it (reject at `Settings`? default on blank? refuse to build the record?)
+        is a config-policy decision rather than a bug fix.
+      * The JSONL line-break split (U+2028 / U+2029 / U+0085, unauthenticated and
+        caller-reachable) is FIXED, on the reader, by the `[human]` ruling of 2026-08-02 —
+        see `_read_record_lines`. It is named here so the history is legible, not as a live
+        gap, and it does not license widening the sentence above: it was a defect that got
+        closed, not evidence that the claim was ever bigger than one predicate.
     """
     return bool(value and value.strip())
 

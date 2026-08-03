@@ -10,14 +10,28 @@ Three properties dominate this file, and all three are guarantees rather than fe
     signature. A ContextVar is process-wide state, and FastAPI runs sync handlers on REUSED
     worker threads, so "request B does not inherit request A's identity" is a privacy
     property that has to be tested, not assumed.
-  * **A 200 never leaves an unverifiable record.** Whatever the HTTP surface accepts must
-    survive `python -m provenance.records --verify`, so the tests at the bottom of this file
-    assert by RUNNING that verifier on the record the request produced, not by inspecting a
-    field. Two fields have failed this in the same way — a whitespace-only `user_agent`
-    (dropped, because it is optional) and a whitespace-only `query` (refused with 422,
-    because `question` is required and there is nothing to drop). They live here rather than
-    beside `test_query_rejects_empty` in `test_api.py` because the claim is about the
-    *record*, which needs this file's `CaptureSink` and pinned `_settings`.
+  * **The `is_present` predicate cannot fork, so a 200 can never produce a record that fails
+    the verifier's `is_present` rules for `question` or `user_agent`.** `QueryRequest` and
+    `records._schema_violations` call the same `records.is_present` function object, resolved
+    as a module attribute at call time. The tests below assert that by RUNNING the real
+    verifier on the record the request produced, not by inspecting a field. Two fields have
+    failed in the same way — a whitespace-only `user_agent` (dropped, because it is optional)
+    and a whitespace-only `query` (refused with 422, because `question` is required and there
+    is nothing to drop). They live here rather than beside `test_query_rejects_empty` in
+    `test_api.py` because the claim is about the *record*, which needs this file's
+    `CaptureSink` and pinned `_settings`.
+
+    This bullet said "a 200 never leaves an unverifiable record" until 2026-08-02, when a gate
+    refuted that by command. The narrower sentence above is what the tests actually establish.
+    The difference, named rather than left implied:
+      - OPEN: `model` is checked by the same predicate but has NO door. `Settings.vlm_model` is
+        unconstrained, so an OPERATOR (never a caller) can set it blank and get HTTP 200 with a
+        record `--verify` rejects: `FAIL ... field=model — empty`. Not tested here, because it
+        is not fixed here — it is carried as a config-policy decision.
+      - CLOSED: the caller-reachable refutation — U+2028 / U+2029 / U+0085 written raw by
+        `ensure_ascii=False` and read back with `str.splitlines()` — is fixed on the reader and
+        pinned at the bottom of this file by
+        `test_a_question_carrying_a_unicode_line_break_is_answered_and_still_verifies`.
 
 Everything here runs on the offline demo pipeline (fakes, no network, no keys); the only
 HTTP is an `httpx.MockTransport`.

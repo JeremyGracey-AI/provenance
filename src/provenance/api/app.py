@@ -14,8 +14,25 @@ eval contract's duck type (`harness_eval/protocol.py`), so the requester travels
 call in a ContextVar (`records.requester_context`) instead of through it.
 
 The door is also where "a question with no content" is refused: `QueryRequest` validates with
-`records.is_present`, the same predicate `--verify` applies to a record's `question`, so an
-answer that returns 200 cannot leave behind a record its own verifier rejects (`_non_blank`).
+`records.is_present` (`_non_blank`), and `--verify` applies the SAME FUNCTION OBJECT to a
+record's `question` and `user_agent` (`records.py:_schema_violations`). Both sides resolve it as
+a module attribute at call time, so the predicate cannot fork. The claim that buys, stated at
+exactly its size: **a 200 can never produce a record that fails the verifier's `is_present`
+rules for `question` or `user_agent`.**
+
+It is NOT true that a 200 can never leave behind a record its own verifier rejects. That larger
+sentence stood here until 2026-08-02 and a gate refuted it by command; one refutation is closed
+and one is open, and both are named rather than implied:
+
+  * OPEN — `Settings.vlm_model` is unconstrained (`config.py`), `records.build_record` copies it
+    into every record, and `--verify` checks it with `is_present`. `vlm_model=" "` -> HTTP 200
+    -> `FAIL ... field=model — empty`, exit 1. This is an OPERATOR-MISCONFIGURATION path: it
+    needs whoever controls the deployment's environment, never a caller, which is the whole
+    difference between it and the two defects the door now closes. Carried, not fixed here —
+    constraining it is a config-policy decision.
+  * CLOSED — the JSONL line-break split (a caller's U+2028 / U+2029 / U+0085 written raw and
+    read back with `str.splitlines()`) is fixed on the reader, in
+    `records._read_record_lines`, by `[human]` ruling.
 """
 
 from __future__ import annotations
