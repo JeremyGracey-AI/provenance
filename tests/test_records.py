@@ -250,6 +250,34 @@ def test_verify_rejects_vacuous_record(tmp_path, capsys):
     assert "field=k" in out and "0 < 1" in out
 
 
+def test_a_non_utf8_file_is_one_violation_and_does_not_mask_tampering(tmp_path, capsys):
+    """2026-08-03 invigilation, defect 4: one corrupt file used to abort the WHOLE run.
+
+    `_read_record_lines` raises `UnicodeDecodeError` — a `ValueError`, which the `except
+    OSError` did not catch — so a single `b'\\xff\\xfe...'` file produced a traceback, empty
+    stdout and exit 1, and a tampered record sitting in the next file was never reported. The
+    exit code looked identical to a real failure, which is what made it dangerous: `--verify`
+    appeared to be doing its job while it had stopped at the first byte it could not decode.
+
+    The three files are named so `sorted()` puts the corrupt one BETWEEN the clean record and
+    the tampered one: if the run still aborted, the tampering would be the violation that goes
+    missing, and the assertion below would fail for the right reason."""
+    _, _, recs = _run_demo_with_sink(tmp_path / "src")
+    clean = recs[0]
+    tampered = dict(clean, run_id="d" * 32, confidence=0.25)  # real value is 1.0 (1/1 supported)
+
+    (tmp_path / "a-clean.jsonl").write_text(json.dumps(clean) + "\n")
+    (tmp_path / "b-corrupt.jsonl").write_bytes(b'\xff\xfe{"run_id": "x"}\n')
+    (tmp_path / "c-tampered.jsonl").write_text(json.dumps(tampered) + "\n")
+
+    assert records.main(["--verify", str(tmp_path)]) == 1
+    out = capsys.readouterr().out
+    assert "b-corrupt.jsonl" in out and "not valid UTF-8" in out  # the corrupt file is NAMED
+    assert "c-tampered.jsonl:1" in out and "field=confidence" in out  # and the run CONTINUED
+    assert "a-clean.jsonl" not in out  # the clean record is not collateral damage
+    assert "2 violation(s)" in out
+
+
 def test_verify_accepts_a_short_retrieved_set(tmp_path):
     """The k bound is `<=`, not `==`: a corpus smaller than k is legitimate and must not
     be turned into a false alarm by the fix for the padded record."""

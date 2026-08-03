@@ -682,8 +682,30 @@ def verify_paths(paths: Iterable[Path]) -> tuple[int, list[Violation]]:
     for path in paths:
         try:
             lines = _read_record_lines(path)
+        except UnicodeDecodeError as exc:
+            # A `ValueError`, NOT an `OSError` — which is why this clause exists (2026-08-03
+            # invigilation, defect 4). One non-UTF-8 file used to abort the whole run with a
+            # traceback and empty stdout, so a TAMPERED record in the next file was never
+            # reported: a corrupt byte anywhere in a directory masked every real violation
+            # after it. A file that is not UTF-8 is not a records file, which is a finding
+            # about that file — reported here, by name, and the loop goes on.
+            #
+            # The message is built from the exception's numeric attributes and its `reason`
+            # (a fixed string from the codec), never from the file's bytes: a records file is
+            # caller-influenced content, and this is a log line.
+            violations.append(
+                Violation(
+                    str(path),
+                    "<file>",
+                    f"not valid UTF-8 ({exc.reason}) at byte offset {exc.start} — "
+                    f"a records file is UTF-8 JSONL; this file was not read",
+                )
+            )
+            continue
         except OSError as exc:
-            violations.append(Violation(str(path), "<file>", f"unreadable: {exc}"))
+            violations.append(
+                Violation(str(path), "<file>", f"unreadable: {type(exc).__name__}: {exc.strerror}")
+            )
             continue
         for lineno, raw in enumerate(lines, start=1):
             if not raw.strip():
