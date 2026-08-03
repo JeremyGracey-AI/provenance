@@ -526,3 +526,48 @@ def test_client_hash_is_exactly_sha256_of_salt_pipe_address():
     assert records.hash_client(_ADDRESS, salt="fixed-test-salt") == expected
     # The address is an input, not a decoration: change it and the digest moves.
     assert records.hash_client(_OTHER_ADDRESS, salt="fixed-test-salt") != expected
+
+
+def test_a_question_carrying_a_unicode_line_break_is_answered_and_still_verifies(tmp_path):
+    """The 2026-08-02 gate's second refutation, end to end, through a REAL `JsonlSink`.
+
+    U+2028 / U+2029 / U+0085 are all `is_present` TRUE — genuinely non-blank text a caller may
+    legitimately ask with — so the door returns 200. `ensure_ascii=False` then wrote them into
+    the day-file raw, and `str.splitlines()` in the reader turned each record into fragments:
+    four honest questions produced ELEVEN violations and `--verify` exit 1, failing the whole
+    day-file for everyone (`verify_paths` verifies a SET). Fixed on the reader by `[human]`
+    ruling; asserted here by running the real verifier over the real file.
+
+    On the transport, because the Day-1 gate's lesson was that `TestClient` runs no HTTP
+    parser: that lesson is about HEADERS, where h11 strips optional whitespace before the app
+    ever sees the value. `query` rides in the JSON body, which `TestClient` and a real socket
+    deliver as identical bytes, so this in-process test is sound for the property it asserts.
+    The wire-level proof was run separately and is not claimed by this file: uvicorn 0.48.0 /
+    h11 0.16.0 on 127.0.0.1, raw sockets, the same three code points plus a `User-Agent`
+    carrying U+0085 -> four `HTTP/1.1 200 OK` and `--verify` exit 0 (exit 1 with 11 violations
+    before the fix).
+
+    The final assertion is the one a caller cares about: the question comes back out of the
+    file byte-identical to the bytes that went in.
+    """
+    line_breaks = ["\u2028", "\u2029", "\u0085"]
+    questions = [f"a{char}b" for char in line_breaks]
+    assert all(records.is_present(q) for q in questions)  # non-blank: 200 is the right answer
+
+    client = _client(JsonlSink(tmp_path), settings=_settings(client_hash_salt="fixed-test-salt"))
+    for question in questions:
+        assert client.post("/query", json={"query": question}).status_code == 200
+
+    (day_file,) = sorted(tmp_path.glob("answers-*.jsonl"))
+    blob = day_file.read_bytes()
+    assert blob.count(b"\n") == len(questions)  # three records, three real delimiters
+    assert len(blob.decode("utf-8").splitlines()) > len(questions)  # splitlines() still lies
+
+    assert records.main(["--verify", str(tmp_path)]) == 0
+
+    stored = [
+        json.loads(line)["question"]
+        for line in records._read_record_lines(day_file)
+        if line.strip()
+    ]
+    assert [q.encode("utf-8") for q in stored] == [q.encode("utf-8") for q in questions]

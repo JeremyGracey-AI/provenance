@@ -25,7 +25,11 @@ def _run_demo_with_sink(tmp_path: Path, question: str = "What are the four tissu
     result = pipeline.run(question)
     files = sorted(tmp_path.glob("answers-*.jsonl"))
     assert len(files) == 1, f"expected one day-file, got {files}"
-    lines = files[0].read_text().splitlines()
+    # Read the file the way the module under test now reads it. This helper used to call
+    # `.read_text().splitlines()` — the exact defect the reader-side fix closed — so a question
+    # containing U+2028 blew the helper up before any assertion ran. A test fixture that
+    # re-implements the reader is a second reader, and two readers is how this started.
+    lines = [line for line in records._read_record_lines(files[0]) if line.strip()]
     return result, files[0], [json.loads(line) for line in lines]
 
 
@@ -127,7 +131,10 @@ def test_verify_fallback_flag_recorded_and_verifies(tmp_path):
     )
     pipeline.run("q")
     (path,) = sorted(tmp_path.glob("answers-*.jsonl"))
-    rec = json.loads(path.read_text().splitlines()[0])
+    # Same rule as `_run_demo_with_sink`: read a records file with the module's own reader,
+    # never a second one spelled `splitlines()` here.
+    (line,) = [ln for ln in records._read_record_lines(path) if ln.strip()]
+    rec = json.loads(line)
     assert rec["claims"][0]["verify_fallback"] is True
     assert rec["claims"][0]["citations"] == ["nowhere#p1"]
     assert records.main(["--verify", str(tmp_path)]) == 0
@@ -253,3 +260,109 @@ def test_verify_accepts_a_short_retrieved_set(tmp_path):
     assert 0 < len(rec["retrieved"]) < rec["k"]
     path = _write(tmp_path, rec, "short.jsonl")
     assert records.main(["--verify", str(path)]) == 0
+
+
+# ------------------------------------------------------------ what counts as a line in JSONL
+#
+# The 2026-08-02 gate's second refutation, and the `[human]` ruling that closed it (fix cycle 3,
+# "Week 4 Day 1 close"). `JsonlSink.write` serializes with `ensure_ascii=False`, so U+0085,
+# U+2028 and U+2029 land in the file RAW; the reader split with `str.splitlines()`, which
+# treats all three as line terminators. One record came back as several fragments and, because
+# `verify_paths` verifies a SET, one HTTP 200 failed the whole day-file. Fixed on the READER
+# (`records._read_record_lines`) — the writer's output was valid JSON all along, and only a
+# reader-side fix can also rescue the files already on disk.
+
+_LINE_BREAKS = {"ls": "\u2028", "ps": "\u2029", "nel": "\u0085"}
+
+
+def test_a_question_carrying_a_unicode_line_break_verifies_and_round_trips(tmp_path):
+    """One record per line means LF, and only LF — proved on the real writer's own output.
+
+    Four assertions, each load-bearing:
+      * the code point is in the file RAW (one occurrence). This pins that the fix did NOT
+        move to the writer: `ensure_ascii=True` would store `\\u2028` and this fails.
+      * the file has exactly one LF per record, while `str.splitlines()` claims more — the
+        trap is still in the text; the reader just no longer falls into it.
+      * `--verify` exits 0 through the real CLI entry point, not a re-implemented read.
+      * the question round-trips BYTE-identically, which is the property a caller actually
+        cares about: their question is stored as they asked it.
+    """
+    for name, char in _LINE_BREAKS.items():
+        directory = tmp_path / name
+        question = f"a{char}b"
+        _, path, _ = _run_demo_with_sink(directory, question)
+
+        blob = path.read_bytes()
+        # Written RAW, never as `\uXXXX`: this pins that the fix did not move to the writer.
+        # (The code point appears more than once — the question is echoed into trace detail —
+        # so the discriminator is raw-present AND escape-absent, not a count.)
+        assert char.encode("utf-8") in blob
+        assert ("\\u%04x" % ord(char)).encode("ascii") not in blob
+        assert blob.count(b"\n") == 1  # exactly one real record delimiter
+        assert len(blob.decode("utf-8").splitlines()) > 1  # ...but splitlines() sees two
+
+        assert records.main(["--verify", str(path)]) == 0
+        (line,) = [ln for ln in records._read_record_lines(path) if ln.strip()]
+        assert json.loads(line)["question"] == question
+        assert json.loads(line)["question"].encode("utf-8") == question.encode("utf-8")
+
+
+def test_verify_reads_a_file_written_with_crlf_line_endings(tmp_path):
+    """A records file that was ever written on Windows reads exactly like one written here.
+
+    Honest about what this proves: `json.loads` tolerates a trailing CR as whitespace, so this
+    would pass even without `_read_record_lines`' CR strip. It is here to pin the BEHAVIOUR
+    (CRLF verifies) rather than the implementation detail, and to state the choice out loud —
+    the strip exists so the text handed to `json.loads` is the record and nothing else."""
+    _, _, first = _run_demo_with_sink(tmp_path / "src", "q one")
+    _, _, second = _run_demo_with_sink(tmp_path / "src2", "q two")
+    path = tmp_path / "crlf.jsonl"
+    path.write_bytes(
+        b"".join(json.dumps(rec).encode("utf-8") + b"\r\n" for rec in (first[0], second[0]))
+    )
+    assert records.main(["--verify", str(path)]) == 0
+
+
+def test_a_lone_carriage_return_is_not_a_record_delimiter(tmp_path, capsys):
+    """CR alone does not separate records, and the reader must not pretend it does.
+
+    This is the test that makes `newline=""` observable rather than decorative. With the io
+    layer's universal-newline translation left ON (`Path.read_text`), a CR would be rewritten
+    to LF *underneath* `_read_record_lines`, and this file would silently verify as two
+    records — the reader inventing a structure the format never had. Two records glued by a CR
+    are one malformed line, and saying so is the honest answer.
+
+    The LF twin below is the control: same two records, same order, exit 0."""
+    _, _, first = _run_demo_with_sink(tmp_path / "src", "q one")
+    _, _, second = _run_demo_with_sink(tmp_path / "src2", "q two")
+    payloads = [json.dumps(first[0]), json.dumps(second[0])]
+
+    glued = tmp_path / "lone-cr.jsonl"
+    glued.write_bytes(("\r".join(payloads) + "\n").encode("utf-8"))
+    assert records.main(["--verify", str(glued)]) == 1
+    assert "invalid JSON" in capsys.readouterr().out
+
+    control = tmp_path / "lf.jsonl"
+    control.write_bytes(("\n".join(payloads) + "\n").encode("utf-8"))
+    assert records.main(["--verify", str(control)]) == 0
+    assert "2 record(s)" in capsys.readouterr().out
+
+
+def test_trailing_newline_and_blank_lines_do_not_become_records(tmp_path, capsys):
+    """The counting edges, pinned by the count the CLI prints.
+
+    A trailing LF must not yield a phantom empty final element, a missing one must not lose
+    the last record, and interior blank lines are not records. All three read `2 record(s)`."""
+    _, _, first = _run_demo_with_sink(tmp_path / "src", "q one")
+    _, _, second = _run_demo_with_sink(tmp_path / "src2", "q two")
+    payloads = [json.dumps(first[0]), json.dumps(second[0])]
+
+    for name, text in (
+        ("trailing.jsonl", "\n".join(payloads) + "\n"),
+        ("no-trailing.jsonl", "\n".join(payloads)),
+        ("blank-lines.jsonl", "\n\n" + payloads[0] + "\n   \n" + payloads[1] + "\n\n"),
+    ):
+        path = tmp_path / name
+        path.write_bytes(text.encode("utf-8"))
+        assert records.main(["--verify", str(path)]) == 0, name
+        assert "2 record(s)" in capsys.readouterr().out, name

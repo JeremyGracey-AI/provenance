@@ -77,6 +77,11 @@ green, in a module that rejects an empty record *set* for exactly that reason.
 Any violation prints the file, record line, and field, and the process exits 1. Zero records
 found is also exit 1 — an empty set verifying green is exactly the false comfort this
 command exists to prevent (a stated, deliberate strictness beyond vacuous truth).
+
+"One JSON object per line" means LF, and only LF: the reader splits with
+`_read_record_lines`, never `str.splitlines()`, which would also break on U+0085 / U+2028 /
+U+2029 — code points that `ensure_ascii=False` writes into the file raw and that a caller can
+put in a question. See that function for the defect, the ruling, and what happens to CRLF.
 """
 
 from __future__ import annotations
@@ -553,6 +558,50 @@ def _consistency_violations(rec: dict, where: str) -> list[Violation]:
     return out
 
 
+def _read_record_lines(path: Path) -> list[str]:
+    r"""Split a JSONL file into records on LF (U+000A) and NOTHING ELSE.
+
+    This function exists because `str.splitlines()` was here, and `splitlines()` is not the
+    JSONL delimiter — it is Python's *text* line splitter, and it also breaks on U+0085 NEXT
+    LINE, U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR. `JsonlSink.write` serializes
+    with `ensure_ascii=False` (see it, above), so those three code points land in the file
+    RAW: legal inside a JSON string, and legal inside a question a caller may ask. One written
+    record therefore came back as several fragments, and because `verify_paths` verifies a
+    SET, a single HTTP 200 on `{"query": "a<U+2028>b"}` failed the WHOLE day-file as invalid
+    JSON (2026-08-02 gate, week4-day1: four honest questions -> eleven violations).
+
+    Fixed on the READER by `[human]` ruling (2026-08-02, "Week 4 Day 1 close"), not on the
+    writer. JSONL is by definition newline-delimited, so the writer's output was valid all
+    along and the reader is what misread it. `ensure_ascii=True` at the writer would also stop
+    the split, but only for records written AFTER the change; this repairs the files already
+    on disk, and keeps the reader correct for files produced by older builds or by hand.
+
+    What it does at each edge, explicitly, because "handles newlines" is not a specification:
+
+    * **Trailing newline** — a well-formed file ends with LF; that final LF is dropped before
+      splitting, so it does not produce a phantom empty final element.
+    * **CRLF** — one trailing CR per line is removed, so a file that was ever written on
+      Windows reads exactly like one written here. Stated honestly rather than sold: this is
+      belt-and-braces, since `json.loads` already tolerates a trailing CR as whitespace. It is
+      safe by construction, not by luck — a raw CR can never be part of a record's CONTENT,
+      because `json.dumps` escapes every code point below 0x20 even with `ensure_ascii=False`
+      (`\r` -> `\\r`, `\x1c` -> `\\u001c`). That escaping threshold is exactly why the gate's
+      `\x1c` probe was harmless while U+0085 was not.
+    * **A lone CR is NOT a delimiter.** `newline=""` turns OFF the io layer's universal-newline
+      translation, which would otherwise rewrite CR to LF underneath this function and quietly
+      re-split a CR-only file into "records" that this format never contained. Such a file
+      fails loudly as invalid JSON instead, which is the truth about a file that is not
+      newline-delimited. (`Path.read_text` cannot express this on 3.12: its `newline=`
+      parameter arrived in 3.13.)
+    * **Blank lines** — returned as-is; `verify_paths` already skips them.
+    """
+    with path.open(encoding="utf-8", newline="") as fh:
+        text = fh.read()
+    if text.endswith("\n"):
+        text = text[:-1]
+    return [line[:-1] if line.endswith("\r") else line for line in text.split("\n")]
+
+
 def verify_paths(paths: Iterable[Path]) -> tuple[int, list[Violation]]:
     """Verify every record in `paths`. Returns (record_count, violations)."""
     violations: list[Violation] = []
@@ -561,7 +610,7 @@ def verify_paths(paths: Iterable[Path]) -> tuple[int, list[Violation]]:
 
     for path in paths:
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            lines = _read_record_lines(path)
         except OSError as exc:
             violations.append(Violation(str(path), "<file>", f"unreadable: {exc}"))
             continue
