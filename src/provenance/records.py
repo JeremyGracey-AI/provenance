@@ -437,23 +437,92 @@ class NullSink:
         return None
 
 
+_WARNED: set[str] = set()
+
+
+def _warn_once(message: str) -> None:
+    """Emit a composition warning to stderr, at most once per distinct message per process.
+
+    Once, because `sink_from_settings` runs at import on a serverless instance and a line
+    repeated on every cold start is a line nobody reads. Per DISTINCT message, so a second,
+    different misconfiguration is never swallowed by the first. Tests rebind `_WARNED`.
+    """
+    if message in _WARNED:
+        return
+    _WARNED.add(message)
+    print(f"[provenance.records] {message}", file=sys.stderr)
+
+
 def sink_from_settings(settings: "Settings") -> "RecordSink | None":
-    """Compose the sink from config, so no caller has to branch on deployment.
+    """Compose the sink from config, so no caller has to branch on deployment — and SAY SO.
 
     Precedence, and the reason for it:
       1. `records_url` + `records_key` -> `HttpSink`. Durable beats local when both are set.
       2. `records_dir`                 -> `JsonlSink`. Local development and the demo server.
-      3. neither                       -> `None`. NO records. Not a silent degradation to a
-         path that will be deleted — an absence you can see, which is the honest state for an
-         unconfigured deployment.
-    A URL without a key (or a key without a URL) is not "configured": it falls through, and
-    the dir/None rules decide.
+      3. neither                       -> `None`. NO records, and a stderr line saying that.
+
+    Every branch except the first is ANNOUNCED on stderr (once per process, `_warn_once`),
+    because this function used to degrade in total silence and the docstring called that "an
+    absence you can see" (2026-08-03 invigilation, defect 9). It was not visible: `records_url`
+    set with `records_key` unset or blank returned `None` with no output at all, the API went
+    on answering 200, and the only way to discover that no record had been written since
+    deployment was to go looking in a store that had never been written to. An absence you can
+    see has to print something; this one now does.
+
+    Two rules that are policy, not formatting:
+
+    * **HALF-CONFIGURED IS LOUD, AND IT STILL PREFERS THE DIR.** url-without-key (or
+      key-without-url) is not "configured", so the durable sink does not run — but when
+      `records_dir` IS set, that dir is used and the fallback is named in the warning rather
+      than taken quietly. Preferring the dir over refusing outright is deliberate, and it is
+      the one judgement call here: (1) `records_dir` is an explicit operator setting, and
+      dropping data the operator asked for because a DIFFERENT setting is half-done punishes
+      the wrong config; (2) this module cannot know the filesystem is ephemeral — on the demo
+      server and in local development a JSONL day-file is genuinely durable, and
+      `api/index.py:29-33` is about a HARDCODED `/tmp` default nobody chose, not about a path
+      an operator named; (3) the honest-absence argument behind that comment is about
+      VISIBILITY, and the warning is what supplies it. Refusing would also lose the records
+      AND hide the dir setting, which is strictly less recoverable.
+    * **This warning names SETTINGS, never their values.** `records_key` is a service_role
+      secret and `records_url` is credential-bearing too (PostgREST accepts `apikey` as a
+      query parameter), and stderr on Vercel is the permanent platform log — the same log
+      defect 2 was about. An operator can read their own environment; the log does not need it.
     """
-    if settings.records_url and settings.records_key:
+    url_set = is_present(settings.records_url)
+    key_set = is_present(settings.records_key)
+    dir_set = is_present(settings.records_dir)
+
+    if url_set and key_set:
         return HttpSink(
             settings.records_url, settings.records_key, timeout=settings.records_timeout_s
         )
-    if settings.records_dir:
+
+    if url_set or key_set:
+        have, missing = (
+            ("PROVENANCE_RECORDS_URL", "PROVENANCE_RECORDS_KEY")
+            if url_set
+            else ("PROVENANCE_RECORDS_KEY", "PROVENANCE_RECORDS_URL")
+        )
+        consequence = (
+            "falling back to the local JSONL sink at PROVENANCE_RECORDS_DIR, which is NOT the "
+            "durable store and does not survive a serverless invocation"
+            if dir_set
+            else "NO decision record will be written for any answer"
+        )
+        _warn_once(
+            f"records HALF-CONFIGURED: {have} is set but {missing} is missing or blank, so the "
+            f"durable HttpSink is NOT running — {consequence}. (Values are deliberately not "
+            f"printed: the key is a service_role secret and the URL can carry one.)"
+        )
+    elif not dir_set:
+        _warn_once(
+            "records are OFF: none of PROVENANCE_RECORDS_URL, PROVENANCE_RECORDS_KEY or "
+            "PROVENANCE_RECORDS_DIR is set, so no decision record will be written for any "
+            "answer. This is a supported state (see api/index.py) — it is announced so the "
+            "absence is visible rather than discovered later in an empty store."
+        )
+
+    if dir_set:
         return JsonlSink(settings.records_dir)
     return None
 

@@ -86,6 +86,14 @@ def _client(sink, *, settings: Settings | None) -> TestClient:
     return TestClient(create_app(demo_pipeline(_settings(), record_sink=sink), settings=settings))
 
 
+@pytest.fixture(autouse=True)
+def _fresh_composition_warnings(monkeypatch):
+    """`records._WARNED` is process-wide by design (one line per cold start, not per answer),
+    which makes it order-dependent state across tests: whichever test ran first would be the
+    only one to see its warning. Every test in this file starts from an empty set."""
+    monkeypatch.setattr(records, "_WARNED", set())
+
+
 # ------------------------------------------------------------------------------- HttpSink
 
 
@@ -292,6 +300,82 @@ def test_sink_from_settings_selects_http_then_dir_then_none(tmp_path):
     assert isinstance(
         sink_from_settings(_settings(records_key=_KEY, records_dir=str(tmp_path))), JsonlSink
     )
+
+
+def test_a_half_configured_store_is_loud_and_writes_nothing(capsys):
+    """Defect 9: url set, key unset → `None`, no stdout, no stderr, and 200s keep coming.
+
+    This is the shape of the failure that has no other signal. Nothing is written, nothing is
+    raised, and the store simply stays empty; the deployment looks healthy from every angle
+    except the one nobody checks. The composition has to announce itself."""
+    assert sink_from_settings(_settings(records_url=_URL)) is None
+    err = capsys.readouterr().err
+    assert "records HALF-CONFIGURED" in err
+    assert "PROVENANCE_RECORDS_KEY" in err  # the missing setting, by name
+    assert "NO decision record will be written" in err
+    assert _URL not in err  # settings are named; values are not printed
+
+
+@pytest.mark.parametrize("blank", ["", " ", "\t", "\xa0"], ids=["empty", "space", "tab", "nbsp"])
+def test_a_blank_key_is_not_a_key(blank, capsys):
+    """`is_present`, not truthiness: a key that is whitespace would authenticate nothing and
+    would 401 forever, so it is the same half-configured state as an unset one."""
+    assert sink_from_settings(_settings(records_url=_URL, records_key=blank)) is None
+    assert "records HALF-CONFIGURED" in capsys.readouterr().err
+
+
+def test_url_plus_blank_key_plus_dir_prefers_the_dir_and_says_so(tmp_path, capsys):
+    """The judgement call, pinned so it is a decision and not an accident.
+
+    url + blank key + `records_dir` set falls back to the LOCAL sink rather than refusing:
+    `records_dir` is an explicit operator setting, and this module cannot know the filesystem
+    is ephemeral (`api/index.py:29-33` is about a hardcoded `/tmp` default nobody chose).
+    What was wrong was the SILENCE — the fallback to a sink that deployment note deliberately
+    removed happened with no output at all. It is now named, including the part an operator
+    needs to hear: this is not the durable store."""
+    settings = _settings(records_url=_URL, records_key="  ", records_dir=str(tmp_path))
+    sink = sink_from_settings(settings)
+    assert isinstance(sink, JsonlSink)
+
+    err = capsys.readouterr().err
+    assert "records HALF-CONFIGURED" in err
+    assert "PROVENANCE_RECORDS_KEY" in err
+    assert "PROVENANCE_RECORDS_DIR" in err and "NOT the durable store" in err
+    assert _URL not in err and str(tmp_path) not in err
+
+
+def test_no_store_at_all_announces_itself(capsys):
+    """"An absence you can see" was in the docstring while the function printed nothing.
+    Either the sentence goes or the line appears; the line appears."""
+    assert sink_from_settings(_settings()) is None
+    err = capsys.readouterr().err
+    assert "records are OFF" in err
+    assert "no decision record will be written for any answer" in err
+
+
+def test_a_fully_configured_store_says_nothing(tmp_path, capsys):
+    """The other half of a warning being worth reading: silence when the config is complete.
+    A warning that fires on the healthy path is a warning that gets filtered out."""
+    assert isinstance(sink_from_settings(_settings(records_url=_URL, records_key=_KEY)), HttpSink)
+    assert isinstance(sink_from_settings(_settings(records_dir=str(tmp_path))), JsonlSink)
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == ""
+
+
+def test_the_composition_warning_is_emitted_once_per_process(capsys):
+    """Once per distinct message: `sink_from_settings` runs at import on every cold start, and
+    a line repeated per answer is a line nobody reads. A DIFFERENT misconfiguration still
+    speaks — deduplication that swallowed the second one would be a new silence."""
+    for _ in range(3):
+        sink_from_settings(_settings(records_url=_URL))
+    err = capsys.readouterr().err
+    assert err.count("records HALF-CONFIGURED") == 1
+
+    sink_from_settings(_settings(records_key=_KEY))  # the mirror-image half-configuration
+    err = capsys.readouterr().err
+    assert err.count("records HALF-CONFIGURED") == 1
+    assert "PROVENANCE_RECORDS_URL" in err
 
 
 def test_sink_from_settings_wires_the_timeout():
