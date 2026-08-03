@@ -1,9 +1,16 @@
 -- Provenance decision records — proposed durable table (Supabase / PostgREST).
 --
--- STATUS: PROPOSAL. Nothing here has been executed against any remote database. Creating
--- the table, minting the key, and setting the Vercel env vars are the human's call
--- (WEEK-4.md Workstream A Day 2); this file exists so that call is one paste, not a design
--- session.
+-- THIS DDL HAS NEVER BEEN EXECUTED AGAINST ANY POSTGRESQL, LOCAL OR REMOTE, BY ANYONE.
+-- Not by its author, and not by the 2026-08-03 invigilation, which could not run it either:
+-- there is no psql, no postgres and no docker on this machine, so its "not examined" section
+-- records the entire file as unverified. Every statement below — the types, the check
+-- constraints, the regex classes, the index definitions — is REASONED, not tested. The first
+-- person to paste it into a SQL editor is the first person to find out whether it parses.
+-- Treat a syntax error as expected, not as a surprise.
+--
+-- STATUS: PROPOSAL. Creating the table, minting the key, and setting the Vercel env vars are
+-- the human's call (WEEK-4.md Workstream A Day 2); this file exists so that call is one
+-- paste, not a design session.
 --
 -- Column names are EXACTLY the JSON keys that `src/provenance/records.py:build_record`
 -- emits, because PostgREST maps a posted JSON object to columns by name. Renaming a column
@@ -17,7 +24,21 @@
 create table if not exists public.answer_records (
     -- run_id is the record's own uuid4 hex from build_record. Making it the primary key
     -- enforces verifier check (d) — run_id unique across the set — in the STORE, not just
-    -- in `--verify`, and makes a retried POST idempotent instead of duplicating a run.
+    -- in `--verify`: two rows can never claim the same run.
+    --
+    -- What this does NOT buy, corrected 2026-08-03 (invigilation defect 15): it does not make
+    -- a retried POST idempotent. That sentence described behaviour the writer cannot exhibit.
+    -- `records.py:HttpSink.write` issues ONE `client.post` per record and no retry, and it
+    -- sends `Prefer: return=minimal` with no `resolution=merge-duplicates`, so a re-POST of an
+    -- existing run_id would come back 409 and be swallowed by the fail-open catch as a dropped
+    -- record. Idempotency is a property of a writer that retries; this writer drops. Anything
+    -- that DOES retry against this table (a backfill script, a queue) must send
+    -- `Prefer: resolution=merge-duplicates` and own that choice itself.
+    --
+    -- Format: `--verify` requires 32 lowercase hex digits (records.py:_RUN_ID_RE). This column
+    -- is plain `text` and does not enforce that. No CHECK is added, deliberately: it would be
+    -- one more untested constraint in a file that has never been parsed by a database, and a
+    -- constraint that fails to parse breaks the whole paste.
     run_id            text primary key,
 
     record_version    integer          not null,
