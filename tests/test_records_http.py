@@ -195,10 +195,22 @@ def test_requester_context_drops_empty_fields():
         assert records.current_requester() is None
 
 
-@pytest.mark.parametrize("blank", [" ", "\t", "   \t  ", "\n"], ids=["space", "tab", "mixed", "nl"])
+@pytest.mark.parametrize(
+    "blank",
+    [" ", "\t", "   \t  ", "\n", "\xa0", "\x85", "\x1c"],
+    ids=["space", "tab", "mixed", "nl", "nbsp", "nel", "fs"],
+)
 def test_requester_context_drops_whitespace_only_fields(blank):
     """The sibling of the test above, and the one that was missing: `""` was dropped but
-    `" "` was not, because the builder tested truthiness and the verifier tested `.strip()`."""
+    `" "` was not, because the builder tested truthiness and the verifier tested `.strip()`.
+
+    The last three are not decoration. Over a real uvicorn/h11 server, `User-Agent: " "`
+    arrives as `""` — h11 strips OWS (SP/HTAB) per RFC 9110 — so the gate's own repro is
+    reachable through starlette's in-process TestClient but not over the wire. `\\xa0`,
+    `\\x85` and `\\x1c` are what IS reachable: h11 passes them through untouched (they are
+    obs-text / not OWS), Python's `str.strip()` removes them, and pre-fix they produced
+    `user_agent='\\xa0'` and `--verify` exit 1 through a genuine socket. Proved on loopback,
+    not asserted — see the fix cycle's report."""
     with records.requester_context(request_id="req-1", user_agent=blank, client_hash=blank):
         assert records.current_requester() == {"request_id": "req-1"}
 
