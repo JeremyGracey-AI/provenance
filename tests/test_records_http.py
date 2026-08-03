@@ -220,6 +220,44 @@ def test_the_key_is_absent_from_stderr_when_an_arbitrary_exception_carries_it(ca
     assert "RuntimeError" in err
 
 
+def test_the_dropped_record_warning_names_the_record_but_never_the_question(capsys):
+    """Defect 10: the warning carried no identity, so systematic loss was unmeasurable.
+
+    A dropped record leaves nothing in the store, so the log line is the ONLY evidence the
+    answer ever happened. Without `run_id` and `timestamp` it cannot be joined to anything —
+    a missing row and a request that never arrived produce the same silence, and "we lost 4%
+    of records between 01:00 and 01:20" is not a question the log can answer.
+
+    The question is the one field deliberately withheld: it is caller text going to the same
+    platform log that defect 2 was about, and a record's identity is enough to find it."""
+    sink = HttpSink(_URL, _KEY, transport=httpx.MockTransport(_explode))
+    record = {
+        "run_id": "a1b2c3d4" * 4,
+        "timestamp": "2026-08-03T01:23:45.678901-07:00",
+        "question": "a-question-nobody-else-should-read",
+    }
+    assert sink.write(record) is None
+
+    err = capsys.readouterr().err
+    assert f"run_id={record['run_id']}" in err
+    assert f"timestamp={record['timestamp']}" in err
+    assert record["question"] not in err
+    assert "question" not in err.replace("a-question", "")  # not by any other spelling either
+
+
+def test_the_dropped_record_warning_survives_a_record_it_cannot_read(capsys):
+    """The warning is a log line, not a data channel: whatever the record holds, the line
+    stays one bounded line of printable ASCII. `HttpSink.write` takes any dict from any
+    caller, so a control character or a megabyte in `timestamp` must not forge log lines."""
+    sink = HttpSink(_URL, _KEY, transport=httpx.MockTransport(_explode))
+    assert sink.write({"run_id": {"not": "a string"}, "timestamp": "x\ny" + "z" * 500}) is None
+    err = capsys.readouterr().err.rstrip("\n")
+
+    assert err.count("\n") == 0  # one line, not three
+    assert "run_id=?" in err  # unreadable collapses, it does not interpolate
+    assert "z" * 500 not in err and len(err) < 200
+
+
 def test_a_clean_key_connect_error_still_says_something_an_operator_can_act_on(capsys):
     """The other half: suppressing the message must not turn the warning into noise.
 

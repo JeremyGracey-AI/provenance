@@ -337,6 +337,22 @@ def _safe_failure_detail(exc: BaseException) -> str:
     return name
 
 
+def _log_token(value: object, *, limit: int = 40) -> str:
+    """One record field, made safe to put in a log line: printable ASCII, bounded, or `?`.
+
+    The two fields this is used on — `run_id` and `timestamp` — are minted by `build_record`
+    (a uuid4 hex and an ISO 8601 stamp), so in production this is the identity function. It
+    exists because `HttpSink.write` accepts ANY dict from any caller, and the discipline of
+    `_safe_failure_detail` above would be pointless if the very next `{}` on the same line
+    could interpolate arbitrary content into the platform log: control characters can forge
+    log lines, and length is a denial-of-service on a log budget. Anything unexpected
+    collapses to `?` rather than being escaped, because a warning is not a data channel.
+    """
+    text = value if isinstance(value, str) else ""
+    kept = "".join(ch for ch in text[:limit] if " " <= ch <= "~")
+    return kept or "?"
+
+
 class HttpSink:
     """POST one record per answer to a REST endpoint (PostgREST/Supabase shape).
 
@@ -398,9 +414,18 @@ class HttpSink:
             # NEVER `{exc!r}`, `{exc}`, or `exc.args` here: this frame runs with the
             # service_role key in scope and the exception may carry it (defect 2). Only
             # `_safe_failure_detail` — a class name and maybe a status int — reaches the log.
+            #
+            # run_id and timestamp make the loss COUNTABLE (defect 10). Without them a dropped
+            # record is indistinguishable from a request that never happened: the row is not in
+            # the store and the warning names nothing, so "how many answers lost their record,
+            # and when" has no answer. With them, the log line joins to the request that
+            # produced it and to the day-file that should have held it. The QUESTION is
+            # deliberately NOT here — it is caller text, and this line goes to the platform log.
             print(
                 f"[provenance.records] http sink failed, record dropped: "
-                f"{_safe_failure_detail(exc)}",
+                f"{_safe_failure_detail(exc)} "
+                f"(run_id={_log_token(record.get('run_id') if isinstance(record, dict) else None)} "
+                f"timestamp={_log_token(record.get('timestamp') if isinstance(record, dict) else None)})",
                 file=sys.stderr,
             )
 
