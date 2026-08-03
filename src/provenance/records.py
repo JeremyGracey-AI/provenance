@@ -1022,8 +1022,30 @@ def verify_paths(paths: Iterable[Path]) -> tuple[int, list[Violation]]:
 
 
 def _collect_files(target: Path) -> list[Path]:
+    """Every `.jsonl` under `target`, at ANY depth. A file argument is itself.
+
+    `glob("*.jsonl")` was here, and non-recursive is the wrong default for this command
+    (2026-08-03 invigilation, defect 14): a tampered record one directory down was skipped and
+    `--verify` printed `OK — 1 record(s)` and exited 0. A verifier whose failure mode is a
+    green tick on an unexamined file is worse than no verifier, and the miss is not
+    hypothetical — this repository's own records live at `records/answers/`, one level below
+    the directory a human would naturally point at, so `--verify records/` examined nothing
+    and said `no records found`.
+
+    Recursive rather than "refuse a directory with subdirectories", because the layout that
+    breaks it is the normal one: `JsonlSink` writes a file per DAY, and any deployment keeping
+    more than a few weeks will shard by month — refusing would turn the honest layout into an
+    error while the flat one silently kept working.
+
+    Symlinked subdirectories are NOT followed (3.12's `**` does not descend into them), so a
+    loop cannot hang the command; a symlink pointing INTO the tree is therefore also not
+    double-counted, which matters because rule (d) rejects duplicate run_ids and a second
+    visit to the same file would look exactly like a duplicate record. Verified on 3.12.13,
+    not assumed. `sorted()` keeps the report order stable, which is what makes the run_id
+    duplicate message ("duplicate of <first>") name the same file every time.
+    """
     if target.is_dir():
-        return sorted(target.glob("*.jsonl"))
+        return sorted(target.rglob("*.jsonl"))
     return [target]
 
 

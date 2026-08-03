@@ -375,16 +375,66 @@ def test_a_non_utf8_file_is_one_violation_and_does_not_mask_tampering(tmp_path, 
     clean = recs[0]
     tampered = dict(clean, run_id="d" * 32, confidence=0.25)  # real value is 1.0 (1/1 supported)
 
-    (tmp_path / "a-clean.jsonl").write_text(json.dumps(clean) + "\n")
-    (tmp_path / "b-corrupt.jsonl").write_bytes(b'\xff\xfe{"run_id": "x"}\n')
-    (tmp_path / "c-tampered.jsonl").write_text(json.dumps(tampered) + "\n")
+    # A directory of its own, holding exactly these three files: `_collect_files` walks
+    # recursively (defect 14), so leaving the pipeline's own `src/` day-file inside the
+    # verified tree would add a duplicate-run_id violation and blunt the assertions below.
+    day = tmp_path / "day"
+    day.mkdir()
+    (day / "a-clean.jsonl").write_text(json.dumps(clean) + "\n")
+    (day / "b-corrupt.jsonl").write_bytes(b'\xff\xfe{"run_id": "x"}\n')
+    (day / "c-tampered.jsonl").write_text(json.dumps(tampered) + "\n")
 
-    assert records.main(["--verify", str(tmp_path)]) == 1
+    assert records.main(["--verify", str(day)]) == 1
     out = capsys.readouterr().out
     assert "b-corrupt.jsonl" in out and "not valid UTF-8" in out  # the corrupt file is NAMED
     assert "c-tampered.jsonl:1" in out and "field=confidence" in out  # and the run CONTINUED
     assert "a-clean.jsonl" not in out  # the clean record is not collateral damage
     assert "2 violation(s)" in out
+
+
+def test_verify_walks_subdirectories(tmp_path, capsys):
+    """2026-08-03 invigilation, defect 14: `glob("*.jsonl")` skipped everything one level down.
+
+    A tampered record in `2026-08/day02/` was not examined and the command printed
+    `OK — 1 record(s)`, exit 0 — a verifier reporting success on a file it never opened. The
+    layout is the normal one, not a contrived one: `JsonlSink` writes a file per day, so any
+    deployment that keeps more than a few weeks shards into directories. This repository's own
+    records already sit at `records/answers/`, one level below the directory a human points at.
+
+    Both halves are asserted: the nested tampering is FOUND, and the file count in the OK line
+    proves the walk reached the nested file rather than the top level twice."""
+    _, _, recs = _run_demo_with_sink(tmp_path / "top")
+    nested = tmp_path / "top" / "2026-08" / "day02"
+    nested.mkdir(parents=True)
+    (nested / "answers-nested.jsonl").write_text(
+        json.dumps(dict(recs[0], run_id="c" * 32, confidence=0.25)) + "\n"
+    )
+
+    assert records.main(["--verify", str(tmp_path / "top")]) == 1
+    out = capsys.readouterr().out
+    assert "answers-nested.jsonl:1" in out and "field=confidence" in out
+    assert "1 violation(s) across 2 record(s)" in out  # the top-level record is still fine
+
+    # And a clean nested tree still verifies, naming both files — the fix must not turn a
+    # sharded directory into a failure.
+    (nested / "answers-nested.jsonl").write_text(json.dumps(dict(recs[0], run_id="c" * 32)) + "\n")
+    assert records.main(["--verify", str(tmp_path / "top")]) == 0
+    assert "2 record(s) across 2 file(s)" in capsys.readouterr().out
+
+
+def test_verify_does_not_follow_a_symlinked_subdirectory(tmp_path, capsys):
+    """The cost of recursion, bounded and asserted rather than assumed.
+
+    A symlink pointing back into the tree would make `--verify` either hang or read the same
+    file twice — and a second visit looks exactly like a duplicate run_id, which is rule (d),
+    so it would manufacture a violation out of a link. Python 3.12's `**` does not descend
+    into symlinked directories; this test is what makes that a property of the command instead
+    of a footnote about the standard library."""
+    _, _, recs = _run_demo_with_sink(tmp_path / "top")
+    (tmp_path / "top" / "loop").symlink_to(tmp_path / "top", target_is_directory=True)
+
+    assert records.main(["--verify", str(tmp_path / "top")]) == 0
+    assert "1 record(s) across 1 file(s)" in capsys.readouterr().out
 
 
 def test_verify_accepts_a_short_retrieved_set(tmp_path):
