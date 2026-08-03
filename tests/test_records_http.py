@@ -1,6 +1,6 @@
-"""The durable sink and the requester context — Week 4 Workstream A, Day 1.
+"""The durable sink, the requester context, and the door — Week 4 Workstream A, Day 1.
 
-Two properties dominate this file, and both are guarantees rather than features:
+Three properties dominate this file, and all three are guarantees rather than features:
 
   * **Fail-open.** A record is best-effort; an answer is not. Every way the network path can
     fail — connect error, non-2xx — must end as a stderr warning and a complete
@@ -10,6 +10,14 @@ Two properties dominate this file, and both are guarantees rather than features:
     signature. A ContextVar is process-wide state, and FastAPI runs sync handlers on REUSED
     worker threads, so "request B does not inherit request A's identity" is a privacy
     property that has to be tested, not assumed.
+  * **A 200 never leaves an unverifiable record.** Whatever the HTTP surface accepts must
+    survive `python -m provenance.records --verify`, so the tests at the bottom of this file
+    assert by RUNNING that verifier on the record the request produced, not by inspecting a
+    field. Two fields have failed this in the same way — a whitespace-only `user_agent`
+    (dropped, because it is optional) and a whitespace-only `query` (refused with 422,
+    because `question` is required and there is nothing to drop). They live here rather than
+    beside `test_query_rejects_empty` in `test_api.py` because the claim is about the
+    *record*, which needs this file's `CaptureSink` and pinned `_settings`.
 
 Everything here runs on the offline demo pipeline (fakes, no network, no keys); the only
 HTTP is an `httpx.MockTransport`.
@@ -400,6 +408,90 @@ def test_a_user_agent_that_is_only_padded_is_kept_verbatim(tmp_path):
     assert record["user_agent"] == "  Mozilla/5.0  "
     path = tmp_path / "padded-ua.jsonl"
     path.write_text(json.dumps(record) + "\n")
+    assert records.main(["--verify", str(path)]) == 0
+
+
+# ------------------------------------------------------------------- the question at the door
+#
+# The same defect one layer up, and the reason it needed a different remedy. `user_agent` is
+# OPTIONAL, so a blank one is dropped and the record simply says less. `question` is REQUIRED —
+# there is nothing to drop — so a blank one has to be refused before a record exists at all.
+# `QueryRequest` already declared `min_length=1`; these tests are that intent finished.
+
+
+@pytest.mark.parametrize(
+    "blank",
+    [" ", "\t", "   \t  ", "\n", "\xa0", "\x85", "\x1c"],
+    ids=["space", "tab", "mixed", "nl", "nbsp", "nel", "fs"],
+)
+def test_a_whitespace_only_query_is_refused_with_422_and_writes_no_record(blank):
+    """`query=" "` was HTTP 200 with a record whose `question` its own verifier rejected
+    (`field=question — empty — a record with no question documents nothing`). One truthiness
+    check and one `.strip()` check disagreeing, exactly as with `user_agent`.
+
+    Unlike the header case, EVERY one of these is reachable over a real socket: `query` rides
+    in a JSON body, where `\\t` and `\\n` are legal escapes and `\\xa0`/`\\x85`/`\\x1c` are
+    legal UTF-8 — no h11 OWS stripping stands between the caller and the field. The header
+    parametrization was a subset forced by the wire; this one is not.
+
+    Two assertions, because 422 alone would not prove the second: no record is written. The
+    request must die at the model, not deep enough in to leave a row behind."""
+    sink = CaptureSink()
+    client = _client(sink, settings=_settings(client_hash_salt="fixed-test-salt"))
+    response = client.post("/query", json={"query": blank}, headers={"user-agent": "pytest-ua/1.0"})
+
+    assert response.status_code == 422
+    assert sink.records == []
+
+    # The error is pydantic's, in pydantic's shape — the same `loc` the `min_length` rejection
+    # beside it produces. Asserted against that rejection rather than a literal, so this pins
+    # the contract (which field failed) and not a version-coupled message string.
+    min_length_loc = client.post("/query", json={"query": ""}).json()["detail"][0]["loc"]
+    assert response.json()["detail"][0]["loc"] == min_length_loc == ["body", "query"]
+    assert sink.records == []
+
+
+def test_a_padded_but_real_query_is_accepted_and_stored_byte_verbatim(tmp_path):
+    """The accept/reject line is never a rewrite line. `question` is verbatim caller text (the
+    Day-1 gate's carried scope note), so padding around real content survives into the record
+    byte for byte — stripping it would have fixed a validation bug by breaking a certified
+    property. And the record still verifies, which is the whole point of the distinction."""
+    padded = f"  {_Q}  "
+    sink = CaptureSink()
+    client = _client(sink, settings=_settings(client_hash_salt="fixed-test-salt"))
+    response = client.post("/query", json={"query": padded})
+    assert response.status_code == 200
+
+    (record,) = sink.records
+    assert record["question"] == padded == "  What are the four tissue types?  "
+    assert record["question"] != _Q  # not silently normalized to the unpadded form
+    assert response.json()["question"] == padded  # the answer echoes it unchanged too
+
+    path = tmp_path / "padded-query.jsonl"
+    path.write_text(json.dumps(record) + "\n")
+    assert records.main(["--verify", str(path)]) == 0
+
+
+def test_every_accepted_query_produces_a_record_the_verifier_accepts(tmp_path):
+    """The property the 422 exists to buy, stated as one test: 200 ⟹ verifiable `question`.
+
+    It holds by construction — `app.py:_non_blank` and `_schema_violations` call the SAME
+    `records.is_present` — so the interesting cases are the ones sitting on that predicate's
+    edge. `"\\u200b"` (zero-width space) is NOT `str.isspace()`, so `.strip()` keeps it: the
+    door must accept it and the verifier must pass it. A validator that had re-implemented
+    "blank" with its own charset would reject it here and the two definitions would have
+    silently forked again — which is the bug this whole cycle is about."""
+    sink = CaptureSink()
+    client = _client(sink, settings=_settings(client_hash_salt="fixed-test-salt"))
+    edge_cases = ["\u200b", f"\u200b{_Q}", "?", " ? ", _Q, f"  {_Q}  ", "\xa0real\xa0"]
+    assert not any(case.strip() == "" for case in edge_cases)  # all genuinely non-blank
+
+    for case in edge_cases:
+        assert client.post("/query", json={"query": case}).status_code == 200
+
+    assert [record["question"] for record in sink.records] == edge_cases  # verbatim, in order
+    path = tmp_path / "accepted-queries.jsonl"
+    path.write_text("".join(json.dumps(record) + "\n" for record in sink.records))
     assert records.main(["--verify", str(path)]) == 0
 
 

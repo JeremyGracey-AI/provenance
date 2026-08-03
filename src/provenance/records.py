@@ -121,7 +121,7 @@ REQUESTER_FIELDS = ("request_id", "user_agent", "client_hash")
 
 
 def is_present(value: str | None) -> bool:
-    """The ONE definition of "present" for an optional string field. Builder AND verifier.
+    """The ONE definition of "present" for a string field. Builder, verifier, AND the door.
 
     It has to be one function because it was briefly two. `requester_context` and
     `build_record` filtered on truthiness while `_schema_violations` filtered on
@@ -135,6 +135,13 @@ def is_present(value: str | None) -> bool:
     simply does not claim to know that thing. Note the asymmetry that is deliberate — this
     decides *whether* to keep a value, never *what* the value is. A user agent is verbatim
     caller text (`"  Mozilla/5.0  "` is stored with its spaces); nothing here strips.
+
+    A third caller now exists, and it is why this docstring no longer says "optional":
+    `api/app.py:_non_blank` validates `QueryRequest.query` with this predicate. `question`
+    is REQUIRED, so dropping it is not available — a blank one has to be refused at the door
+    (422) instead. Same predicate, two dispositions, one definition of blank: that is the
+    point. Anything that returns 200 therefore satisfies the `question` rule below by
+    construction, not by two functions agreeing.
     """
     return bool(value and value.strip())
 

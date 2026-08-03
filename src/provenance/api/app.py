@@ -12,15 +12,20 @@ API cannot start quietly fingerprinting callers because someone forgot an argume
 `Pipeline.run(question) -> GroundedAnswer` is untouched by all of this, on purpose: it is the
 eval contract's duck type (`harness_eval/protocol.py`), so the requester travels beside the
 call in a ContextVar (`records.requester_context`) instead of through it.
+
+The door is also where "a question with no content" is refused: `QueryRequest` validates with
+`records.is_present`, the same predicate `--verify` applies to a record's `question`, so an
+answer that returns 200 cannot leave behind a record its own verifier rejects (`_non_blank`).
 """
 
 from __future__ import annotations
 
 import secrets
 import uuid
+from typing import Annotated
 
 from fastapi import FastAPI, Request
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field
 
 from provenance import records
 from provenance.config import Settings
@@ -30,8 +35,39 @@ from provenance.pipeline import Pipeline
 _MAX_USER_AGENT = 300
 
 
+def _non_blank(value: str) -> str:
+    """Reject a whitespace-only query — the same defect class as the blank user_agent, one
+    layer up, and the completion of an intent this model already stated.
+
+    `min_length=1` says a query must have content. `" "` satisfies the length check and
+    documents nothing: it was HTTP 200, a record with `question: " "`, and
+    `python -m provenance.records --verify` exit 1 on `field=question — empty — a record
+    with no question documents nothing`. Truthy to one layer, empty to another — exactly the
+    split `records.is_present` was made a function to close (see its docstring). `question`
+    is REQUIRED, so the builder-side fix that worked for `user_agent` (drop the field) has
+    nothing to drop here: the only place the two definitions can be reconciled is the door.
+
+    So this calls `records.is_present` rather than spelling `.strip()` again. Re-implementing
+    the predicate here would rebuild the original bug's shape — two notions of "blank" that
+    agree today — in the module that is fixing it.
+
+    Rejects, never rewrites. An accepted query is returned BYTE-FOR-BYTE: `"  real  "` keeps
+    its padding all the way into the record, because `question` is verbatim caller text (the
+    Day-1 gate's carried scope note) and normalizing it would break that property to fix a
+    validation problem. The `return value` is load-bearing — an `AfterValidator` that fell
+    off the end would rewrite the field to None.
+
+    Raising ValueError makes this part of the MODEL, not the handler: FastAPI renders it as a
+    422 whose body names `["body", "query"]`, the same shape as the `min_length` rejection
+    beside it, instead of a hand-rolled error the handler would have to invent.
+    """
+    if not records.is_present(value):
+        raise ValueError("must contain at least one non-whitespace character")
+    return value
+
+
 class QueryRequest(BaseModel):
-    query: str = Field(min_length=1, max_length=2000)
+    query: Annotated[str, Field(min_length=1, max_length=2000), AfterValidator(_non_blank)]
 
 
 def _request_id(request: Request) -> str:
