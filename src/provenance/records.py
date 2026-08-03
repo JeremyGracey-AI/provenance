@@ -65,15 +65,43 @@ record is schema-complete AND internally consistent:
       record claiming citations-free grounding with fallback false is caught here,
       by name, rather than needing a separate rule.
   (c) every claim citation is a retrieved page id OR that claim's verify_fallback is true,
-  (d) run_id is unique within the verified set (across all files in a directory),
+  (d) run_id is unique within the verified set (across all files in a directory, and the
+      directory is walked RECURSIVELY — see `_collect_files`),
   (e) trace started_at values are monotone non-decreasing within a record,
   (f) `len(retrieved) <= k` — fully determined by the record (finding 9: a record padded to
       40 retrieved ids with `k: 5` verified clean, and the padding is what made its
-      citations resolve).
+      citations resolve),
+  (g) `retrieved` holds DISTINCT page ids: one page retrieved once. Rule (f) alone left the
+      padding attack open at a smaller size — k copies of the one cited page satisfies it.
 Schema completeness also rejects VACUOUS records (finding 9): question and model must be
 non-empty, `k >= 1`, and `timestamp` must actually PARSE as ISO 8601 — it was previously
 type-checked only, so `timestamp: "tuesday-ish"` passed. An all-empty record used to verify
 green, in a module that rejects an empty record *set* for exactly that reason.
+
+The 2026-08-03 invigilation (defect 12) crafted thirteen records and this verifier blessed
+twelve. What it now also refuses, each rule against a named crafted record:
+  * `record_version` must EQUAL `RECORD_VERSION`. It was defined and never compared, so
+    `99` and `-1` both passed — a record announcing a schema this file does not implement.
+  * `run_id` must be 32 lowercase hex digits, as `build_record` mints and this schema
+    documents. `"../../etc/passwd"` was a valid run_id. (Hygiene, not a traversal fix:
+    nothing here builds a path from it.)
+  * `timestamp` must be TIMEZONE-AWARE (the schema line above says "with UTC offset") and no
+    earlier than this repository. A naive stamp and `0001-01-01T00:00:00+00:00` both passed.
+    There is no upper bound by design — see `_EARLIEST_TIMESTAMP`.
+  * `duration_ms` must be finite and >= 0, `started_at` finite and >= 0, `score` finite.
+    `json.loads` accepts `Infinity`/`NaN`, so non-finite numbers are reachable, and a
+    negative duration is a measurement no monotonic clock can produce.
+  * A record whose `retrieved`, `claims` AND `trace` are all empty is refused as documenting
+    no decision. It is the interesting one: it passed every per-field vacuity rule above
+    while asserting nothing about what was retrieved, answered, or run.
+Two crafted records are still ACCEPTED, deliberately, and are stated here rather than left to
+be rediscovered: a 1 MB `question` (any cap here without a matching cap at the door would
+re-create the two-definitions defect that `is_present` exists to prevent — a 200 whose record
+its own verifier rejects; the cap belongs at the door and is a product decision), and
+`score: 1e308` (finite, and `score` is backend-defined — `page_index` and
+`embedding_retriever` do not share a scale, so any magnitude bound here would be a false
+constraint rather than a check).
+
 Any violation prints the file, record line, and field, and the process exits 1. Zero records
 found is also exit 1 — an empty set verifying green is exactly the false comfort this
 command exists to prevent (a stated, deliberate strictness beyond vacuous truth).
@@ -90,11 +118,13 @@ import argparse
 import contextvars
 import hashlib
 import json
+import math
+import re
 import sys
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Iterator, Protocol
 
@@ -108,6 +138,22 @@ if TYPE_CHECKING:
 RECORD_VERSION = 1
 
 _VERDICTS = ("supported", "unsupported")
+
+# `build_record` mints `uuid.uuid4().hex`, and the schema above says so. The verifier now says
+# it too (2026-08-03 invigilation, defect 12: `run_id` was type-checked only, so
+# `"../../etc/passwd"` verified clean). This is SCHEMA HYGIENE, not a traversal fix — nothing
+# in this repo builds a path from `run_id` (`JsonlSink` derives its day-file from `timestamp`,
+# `_collect_files` from the CLI argument) — but a field documented as a uuid4 hex should be
+# one, and the store makes it a primary key.
+_RUN_ID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
+
+# A record cannot predate the repository that writes it: first commit 296feb9, 2026-05-28.
+# This is the floor that rejects the crafted year-0001 stamp (defect 12). There is deliberately
+# NO ceiling: "not in the future" would make verification depend on when it is run, and the
+# schema already has the right mechanism for a back-dated or wrong-clock record — the store's
+# server-side `inserted_at` column (docs/records-schema.sql:85-87), which is set by the
+# database rather than by the writer being checked.
+_EARLIEST_TIMESTAMP = datetime(2026, 5, 28, tzinfo=timezone.utc)
 
 
 # ----------------------------------------------------------------------- requester context
@@ -540,6 +586,21 @@ class Violation:
         return f"FAIL {self.where} field={self.field} — {self.message}"
 
 
+def _excerpt(value: object, limit: int = 64) -> str:
+    """A record's own content, quoted into a violation message and BOUNDED.
+
+    Violations name the offending value, which is what makes them actionable — but the value
+    is caller-influenced (a question is verbatim caller text) and a record can be enormous:
+    the invigilator's crafted set includes a 1 MB question. An unbounded `{value!r}` in a
+    message turns one bad record into a megabyte of stdout, so every excerpt is truncated and
+    says that it was.
+    """
+    text = repr(value)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}… ({len(text)} chars)"
+
+
 def _schema_violations(rec: dict, where: str) -> list[Violation]:
     """Schema completeness: every field present with the right shape. Returns [] when clean."""
     out: list[Violation] = []
@@ -563,21 +624,76 @@ def _schema_violations(rec: dict, where: str) -> list[Violation]:
             return None
         return value
 
-    expect(rec, "record_version", (int,), "record_version")
-    expect(rec, "run_id", (str,), "run_id")
+    # `RECORD_VERSION` was defined at the top of this file and never compared to anything
+    # (2026-08-03 invigilation, defect 12: `record_version: 99` and `record_version: -1` both
+    # verified clean). A record announcing a schema this file does not implement must not be
+    # read as though it did: the fields would be interpreted under the wrong contract, which
+    # is the entire reason the field exists.
+    version = expect(rec, "record_version", (int,), "record_version")
+    if version is not None and version != RECORD_VERSION:
+        out.append(
+            Violation(
+                where,
+                "record_version",
+                f"{version} != {RECORD_VERSION} — this verifier implements record_version "
+                f"{RECORD_VERSION} only and will not interpret another schema's fields",
+            )
+        )
+
+    run_id = expect(rec, "run_id", (str,), "run_id")
+    if run_id is not None and not _RUN_ID_RE.match(run_id):
+        out.append(
+            Violation(
+                where,
+                "run_id",
+                f"{_excerpt(run_id)} is not a uuid4 hex (32 lowercase hex digits, as "
+                f"build_record mints and the schema documents)",
+            )
+        )
+
     expect(rec, "confidence", (int, float), "confidence")
     expect(rec, "repairs", (int,), "repairs")
 
     # Vacuity checks (2026-08-02 invigilation finding 9): an all-empty record used to be
     # schema-complete. A record that documents nothing is not a record.
+    #
+    # The timestamp rules are three, and each rejects a different crafted record (defect 12):
+    # it must PARSE (`"tuesday-ish"` passed when the field was type-checked only), it must be
+    # TIMEZONE-AWARE (the schema at the top of this file specifies "ISO 8601 with UTC offset",
+    # and a naive stamp is unorderable against records from another host), and it must be no
+    # earlier than this repository (`0001-01-01T00:00:00+00:00` is a well-formed aware ISO
+    # timestamp and passed both of the other two).
     timestamp = expect(rec, "timestamp", (str,), "timestamp")
     if timestamp is not None:
         try:
-            datetime.fromisoformat(timestamp)
+            parsed = datetime.fromisoformat(timestamp)
         except ValueError:
             out.append(
-                Violation(where, "timestamp", f"not a parseable ISO 8601 timestamp: {timestamp!r}")
+                Violation(
+                    where, "timestamp", f"not a parseable ISO 8601 timestamp: {_excerpt(timestamp)}"
+                )
             )
+        else:
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                out.append(
+                    Violation(
+                        where,
+                        "timestamp",
+                        f"{_excerpt(timestamp)} has no UTC offset — the schema requires an "
+                        f"offset-aware ISO 8601 stamp, and a naive one cannot be ordered "
+                        f"against a record written anywhere else",
+                    )
+                )
+            elif parsed < _EARLIEST_TIMESTAMP:
+                out.append(
+                    Violation(
+                        where,
+                        "timestamp",
+                        f"{_excerpt(timestamp)} predates "
+                        f"{_EARLIEST_TIMESTAMP.date().isoformat()}, the first commit of the "
+                        f"repository that writes these records",
+                    )
+                )
     for field in ("question", "model"):
         value = expect(rec, field, (str,), field)
         if value is not None and not is_present(value):
@@ -606,7 +722,14 @@ def _schema_violations(rec: dict, where: str) -> list[Violation]:
                 out.append(Violation(where, f"retrieved[{i}]", "expected object"))
                 continue
             expect(item, "id", (str,), f"retrieved[{i}].id")
-            expect(item, "score", (int, float), f"retrieved[{i}].score")
+            score = expect(item, "score", (int, float), f"retrieved[{i}].score")
+            # `json.loads` accepts `Infinity` and `NaN` (Python's extension to JSON), so a
+            # non-finite score is a record a reader can actually produce — and NaN silently
+            # breaks every ordering and threshold applied downstream.
+            if score is not None and not math.isfinite(score):
+                out.append(
+                    Violation(where, f"retrieved[{i}].score", f"{score!r} is not a finite number")
+                )
 
     claims = expect(rec, "claims", (list,), "claims")
     if claims is not None:
@@ -630,9 +753,54 @@ def _schema_violations(rec: dict, where: str) -> list[Violation]:
                 out.append(Violation(where, f"trace[{i}]", "expected object"))
                 continue
             expect(span, "name", (str,), f"trace[{i}].name")
-            expect(span, "duration_ms", (int, float), f"trace[{i}].duration_ms")
+            # A span cannot take negative time (defect 12: `duration_ms: -1` verified clean).
+            # `Trace` measures with a monotonic clock, so a negative duration is not a clock
+            # adjustment — it is a value nothing in this system can produce.
+            duration = expect(span, "duration_ms", (int, float), f"trace[{i}].duration_ms")
+            if duration is not None and not (math.isfinite(duration) and duration >= 0):
+                out.append(
+                    Violation(
+                        where,
+                        f"trace[{i}].duration_ms",
+                        f"{duration!r} — a span's duration is a finite, non-negative number of "
+                        f"milliseconds",
+                    )
+                )
             expect(span, "detail", (dict,), f"trace[{i}].detail")
-            expect(span, "started_at", (int, float), f"trace[{i}].started_at")
+            started = expect(span, "started_at", (int, float), f"trace[{i}].started_at")
+            if started is not None and not (math.isfinite(started) and started >= 0):
+                out.append(
+                    Violation(
+                        where,
+                        f"trace[{i}].started_at",
+                        f"{started!r} — a wall-clock epoch is a finite, non-negative number of "
+                        f"seconds; the monotonicity check below cannot order NaN",
+                    )
+                )
+
+    # THE FULLY VACUOUS DECISION RECORD (2026-08-03 invigilation, defect 12). Every rule above
+    # is about a field being well-formed, and a record with an empty `retrieved`, an empty
+    # `claims` AND an empty `trace` satisfies all of them: a real question, a real model, k=5,
+    # `confidence: 0.0` (which recomputes correctly, because there are no claims), a valid
+    # timestamp — and no decision documented anywhere in it. It passed every vacuity rule the
+    # docstring at the top of this file advertises, which is exactly what made it worth
+    # crafting: the rules were per-field, and vacuity is a property of the WHOLE record.
+    #
+    # Stated as the conjunction it is, deliberately: a run with no retrieved pages is possible
+    # (an empty corpus), a run with no claims is possible (a refusal), and no legitimate run
+    # has an empty trace — but the conjunction of all three describes a record whose only
+    # content is its own metadata. `verify_paths` refuses an empty record SET for exactly this
+    # reason (see the module docstring); an empty record is the same false comfort per row.
+    if all(isinstance(rec.get(field), list) for field in ("retrieved", "claims", "trace")):
+        if not (rec["retrieved"] or rec["claims"] or rec["trace"]):
+            out.append(
+                Violation(
+                    where,
+                    "<record>",
+                    "documents no decision: retrieved, claims and trace are ALL empty, so the "
+                    "record asserts nothing about what was retrieved, answered or run",
+                )
+            )
 
     return out
 
@@ -659,6 +827,28 @@ def _consistency_violations(rec: dict, where: str) -> list[Violation]:
 
     retrieved = rec["retrieved"]
     retrieved_ids = {item["id"] for item in retrieved}
+
+    # (g) `retrieved` is a list of DISTINCT pages. A retriever returns each page once — the
+    #     real ones index by id (backends/page_index.py, embedding_retriever.py) — so a repeat
+    #     is not a run that happened. It is also the padded record's second move: rule (f)
+    #     below bounds `len(retrieved)` by k, and duplicating the one cited page k times is how
+    #     a crafted record satisfies that bound while still making its citations resolve
+    #     (2026-08-03 invigilation, defect 12).
+    if len(retrieved_ids) != len(retrieved):
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for item in retrieved:
+            if item["id"] in seen and item["id"] not in duplicates:
+                duplicates.append(item["id"])
+            seen.add(item["id"])
+        out.append(
+            Violation(
+                where,
+                "retrieved",
+                f"duplicate page id(s) {_excerpt(duplicates, 200)} — a retrieval returns each "
+                f"page once",
+            )
+        )
 
     # (f) retrieved is bounded by k. Fully determined by the record, and the check the
     #     padded record needed: 40 retrieved ids under `k: 5` is not a k=5 run, and the

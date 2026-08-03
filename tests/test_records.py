@@ -11,6 +11,8 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 from provenance import records
 from provenance.backends.fakes import KeywordRouter, ScriptedRetriever
 from provenance.config import Settings
@@ -248,6 +250,113 @@ def test_verify_rejects_vacuous_record(tmp_path, capsys):
     assert "field=question" in out
     assert "field=model" in out
     assert "field=k" in out and "0 < 1" in out
+
+
+# --------------------------------------------------------------------------------------
+# The 2026-08-03 invigilation crafted THIRTEEN records and this verifier blessed twelve
+# (defect 12). The crafted files themselves are not in the repo — the review states them in
+# prose (reviews/2026-08-03-week4-as-built.md:85-90) — so these are a RECONSTRUCTION from
+# that description, not the invigilator's own corpus.
+#
+# Each mutation starts from a record the demo pipeline really wrote and changes ONE thing, so
+# a rejection can only be caused by the thing changed. The expected substring names the field,
+# because a record that fails for the wrong reason is a coincidence, not a check.
+# --------------------------------------------------------------------------------------
+
+
+def _naive(timestamp: str) -> str:
+    """Drop the UTC offset, keep everything else — `2026-08-02T11:50:43.9-07:00` → naive."""
+    return datetime.fromisoformat(timestamp).replace(tzinfo=None).isoformat()
+
+
+_CRAFTED_REJECTED = {
+    "record_version-99": (lambda rec: {**rec, "record_version": 99}, "field=record_version"),
+    "record_version--1": (lambda rec: {**rec, "record_version": -1}, "field=record_version"),
+    "run_id-path": (lambda rec: {**rec, "run_id": "../../etc/passwd"}, "field=run_id"),
+    "timestamp-year-0001": (
+        lambda rec: {**rec, "timestamp": "0001-01-01T00:00:00+00:00"},
+        "predates 2026-05-28",
+    ),
+    "timestamp-naive": (
+        lambda rec: {**rec, "timestamp": _naive(rec["timestamp"])},
+        "has no UTC offset",
+    ),
+    "duration_ms-negative": (
+        lambda rec: {**rec, "trace": [{**rec["trace"][0], "duration_ms": -1.0}, *rec["trace"][1:]]},
+        "field=trace[0].duration_ms",
+    ),
+    "score-nan": (
+        lambda rec: {
+            **rec,
+            "retrieved": [{**rec["retrieved"][0], "score": float("nan")}, *rec["retrieved"][1:]],
+        },
+        "field=retrieved[0].score",
+    ),
+    "retrieved-duplicated": (
+        lambda rec: {**rec, "retrieved": [rec["retrieved"][0]] * 3},
+        "duplicate page id(s)",
+    ),
+    "vacuous-decision": (
+        lambda rec: {**rec, "retrieved": [], "claims": [], "trace": [], "confidence": 0.0},
+        "documents no decision",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "mutate, needle", list(_CRAFTED_REJECTED.values()), ids=list(_CRAFTED_REJECTED)
+)
+def test_verify_rejects_each_crafted_record(mutate, needle, tmp_path, capsys):
+    """Nine of the twelve records that used to verify clean, each now refused BY NAME.
+
+    The last entry is the one worth reading twice. `vacuous-decision` keeps a real question, a
+    real model, `k: 5`, a valid run_id and a valid timestamp, and empties only `retrieved`,
+    `claims` and `trace`. Every per-field rule the module docstring advertises still passes —
+    including the confidence recompute, which is satisfied *because* there are no claims — and
+    the record documents no decision at all. Vacuity was checked field by field; it is a
+    property of the whole record."""
+    _, _, recs = _run_demo_with_sink(tmp_path / "src")
+    path = _write(tmp_path, mutate(recs[0]), "crafted.jsonl")
+
+    assert records.main(["--verify", str(path)]) == 1
+    assert needle in capsys.readouterr().out
+
+
+def test_verify_accepts_the_unmutated_control(tmp_path):
+    """The control the invigilator's set had, and the reason every rule above is a rule and
+    not a coincidence: the record these nine were built from verifies clean."""
+    _, _, recs = _run_demo_with_sink(tmp_path / "src")
+    assert records.main(["--verify", str(_write(tmp_path, recs[0], "control.jsonl"))]) == 0
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda rec: {**rec, "question": "x" * 1_000_000}, id="question-1mb"),
+        pytest.param(
+            lambda rec: {
+                **rec,
+                "retrieved": [{**rec["retrieved"][0], "score": 1e308}, *rec["retrieved"][1:]],
+            },
+            id="score-1e308",
+        ),
+    ],
+)
+def test_two_crafted_records_are_still_accepted_on_purpose(mutate, tmp_path):
+    """The two left standing, pinned so the decision is visible rather than an omission.
+
+    * **1 MB question.** A length cap HERE and nowhere else would re-create the exact defect
+      `is_present` exists to prevent: the door would return 200 and this verifier would refuse
+      the record it produced, failing the whole day-file for a caller who did nothing wrong
+      (`verify_paths` verifies a SET). The cap belongs at the door, and what the maximum should
+      be is a product decision, not a fix.
+    * **`score: 1e308`.** It is finite, and `score` has no shared scale: `page_index` and
+      `embedding_retriever` define it independently, so any magnitude bound here would be a
+      false constraint dressed as a check. Non-finite IS refused, because NaN breaks ordering.
+    """
+    _, _, recs = _run_demo_with_sink(tmp_path / "src")
+    path = _write(tmp_path, mutate(recs[0]), "accepted.jsonl")
+    assert records.main(["--verify", str(path)]) == 0
 
 
 def test_a_non_utf8_file_is_one_violation_and_does_not_mask_tampering(tmp_path, capsys):
