@@ -41,9 +41,45 @@ create table if not exists public.answer_records (
     -- unauthenticated write into the record store. user_agent, by contrast, IS caller-
     -- controlled text and is stored knowingly — that is what a User-Agent is.
     request_id        text,
-    user_agent        text,
+    -- Present-but-BLANK is not a third state. `--verify` rejects it ("present but empty —
+    -- omit the field instead") and `build_record` no longer emits it, because both now share
+    -- `records.py:is_present`. This constraint puts the same rule in the STORE so the row
+    -- cannot be inserted here and fail verification later, when it is a human's DELETE
+    -- instead of a dropped field — `verify_paths` verifies a SET, so one blank row fails the
+    -- whole table. (This is the 2026-08-02 Day-1 gate's blocking defect: `User-Agent: " "`
+    -- → HTTP 200 → `--verify` exit 1, and this column had no constraint at all. Over a real
+    -- uvicorn/h11 stack the trigger byte is not " " — h11 strips OWS, so " " arrives as ""
+    -- — it is `User-Agent: \xa0`, legal obs-text per RFC 9110, which h11 passes through
+    -- untouched and Python's str.strip() calls blank. Verified on loopback, both bytes.)
+    --
+    -- `[^[:space:]]` and deliberately NOT `btrim(user_agent) <> ''`: btrim removes "a space
+    -- by default" (PG docs, functions-string.html), so btrim(E'\t') is E'\t' and the naive
+    -- form would ACCEPT a tab-only value that Python's str.strip() calls blank — the same
+    -- two-definitions-of-present defect, rebuilt across the store/verifier boundary. This is
+    -- the literal expansion of `\S` (functions-matching.html) and carries no backslash, so
+    -- standard_conforming_strings cannot change what it means: at least one non-space char.
+    --
+    -- Residual gap, named because it is real and not hypothetical: [[:space:]] is
+    -- locale/ctype-defined and in most UTF-8 locales U+00A0 is NOT a space, while Python's
+    -- str.strip() removes it — the very byte above. So this check is a COARSER filter than
+    -- `--verify`, not an equal one. Provenance itself cannot post such a row (is_present
+    -- drops it before the sink); this constraint is the second line, for any other writer.
+    -- A human who wants exact parity with str.strip() can substitute the class below, which
+    -- adds every code point Python treats as whitespace that [[:space:]] may not — left
+    -- commented because NOTHING HERE HAS BEEN RUN AGAINST A DATABASE and a check constraint
+    -- that fails to parse breaks the whole paste:
+    --   check (user_agent is null or user_agent ~
+    --     '[^[:space:]\u001c-\u001f\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]')
+    user_agent        text check (user_agent is null or user_agent ~ '[^[:space:]]'),
     -- Salted SHA-256 of the client address (src/provenance/records.py:hash_client).
     -- A RAW IP MUST NEVER BE WRITTEN TO THIS COLUMN. 64 lowercase hex chars, enforced:
+    --
+    -- READ THIS BEFORE ANALYSING THE COLUMN: a NULL client_hash does NOT mean "no address was
+    -- available". Address capture is caller-suppressible — `x-forwarded-for: " "` or `","`
+    -- makes `_client_address` return None (src/provenance/api/app.py:62-65), `hash_client`
+    -- then returns None, and the field is dropped from an otherwise valid record. So this
+    -- column counts callers who did not suppress it, and any "% of answers identified" metric
+    -- computed from it is a lower bound, not a rate.
     client_hash       text check (client_hash ~ '^[0-9a-f]{64}$'),
 
     -- Server-side insert time. Distinct from "timestamp" (which the app sets) so a
