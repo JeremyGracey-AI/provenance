@@ -194,6 +194,14 @@ def test_requester_context_drops_empty_fields():
         assert records.current_requester() is None
 
 
+@pytest.mark.parametrize("blank", [" ", "\t", "   \t  ", "\n"], ids=["space", "tab", "mixed", "nl"])
+def test_requester_context_drops_whitespace_only_fields(blank):
+    """The sibling of the test above, and the one that was missing: `""` was dropped but
+    `" "` was not, because the builder tested truthiness and the verifier tested `.strip()`."""
+    with records.requester_context(request_id="req-1", user_agent=blank, client_hash=blank):
+        assert records.current_requester() == {"request_id": "req-1"}
+
+
 def test_requester_fields_recorded_within_a_request():
     sink = CaptureSink()
     client = _client(sink, settings=_settings(client_hash_salt="fixed-test-salt"))
@@ -335,3 +343,49 @@ def test_verify_rejects_a_record_claiming_an_empty_requester_field(tmp_path, cap
     path.write_text(json.dumps(record) + "\n")
     assert records.main(["--verify", str(path)]) == 1
     assert "field=client_hash" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("blank", [" ", "\t", "   \t  "], ids=["space", "tab", "mixed"])
+def test_a_whitespace_only_user_agent_is_omitted_not_written_blank(blank, tmp_path):
+    """The Day-1 gate's blocking defect, end to end (2026-08-02, week4-day1).
+
+    `User-Agent: " "` is truthy, so the builder wrote it; `" ".strip()` is empty, so
+    `--verify` refused it — HTTP 200 and a record that Provenance's own verifier rejects.
+    It blocks rather than annoys because `verify_paths` verifies a SET: one such row, which
+    any unauthenticated caller can post, fails the whole day-file or table until a human
+    deletes it. The record must therefore come out of the HTTP path ALREADY verifiable —
+    asserted here by running the real `--verify`, not by inspecting the field alone."""
+    sink = CaptureSink()
+    client = _client(sink, settings=_settings(client_hash_salt="fixed-test-salt"))
+    response = client.post(
+        "/query",
+        json={"query": _Q},
+        headers={"user-agent": blank, "x-forwarded-for": _ADDRESS},
+    )
+    assert response.status_code == 200
+
+    (record,) = sink.records
+    assert "user_agent" not in record  # absent, not blank: the record claims nothing it lacks
+    assert len(record["request_id"]) == 32 and len(record["client_hash"]) == 64  # others intact
+
+    path = tmp_path / "blank-ua.jsonl"
+    path.write_text(json.dumps(record) + "\n")
+    assert records.main(["--verify", str(path)]) == 0
+
+
+def test_a_user_agent_that_is_only_padded_is_kept_verbatim(tmp_path):
+    """The other half of the fix, and the reason it drops rather than strips: `is_present`
+    decides WHETHER to keep a value, never what it is. `user_agent` is verbatim caller text
+    (the gate's carried scope note), so its padding survives — and still verifies."""
+    sink = CaptureSink()
+    client = _client(sink, settings=_settings(client_hash_salt="fixed-test-salt"))
+    assert client.post(
+        "/query", json={"query": _Q}, headers={"user-agent": "  Mozilla/5.0  "}
+    ).status_code == 200
+
+    (record,) = sink.records
+    assert record["user_agent"] == "  Mozilla/5.0  "
+    path = tmp_path / "padded-ua.jsonl"
+    path.write_text(json.dumps(record) + "\n")
+    assert records.main(["--verify", str(path)]) == 0
+

@@ -35,6 +35,10 @@ composed `Settings` (see `api/app.py`); absent for eval runs, the CLI, and tests
                               stored as such on purpose: a coarse client hint is the point
     client_hash      str      SALTED SHA-256 of the client address — never the address itself
 
+Each of the three is dropped when it is missing OR whitespace-only — one predicate,
+`is_present`, shared with the verifier, so "present" cannot mean two things (see its
+docstring for the defect that made it a function).
+
 `record_version` stays **1**. These three are optional ADDITIONS: a v1 record without them
 is still valid, a record with them is a superset, and the verifier below checks them only
 `if present`. Bumping the version would buy nothing and would force version dispatch into
@@ -116,6 +120,25 @@ _REQUESTER: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
 REQUESTER_FIELDS = ("request_id", "user_agent", "client_hash")
 
 
+def is_present(value: str | None) -> bool:
+    """The ONE definition of "present" for an optional string field. Builder AND verifier.
+
+    It has to be one function because it was briefly two. `requester_context` and
+    `build_record` filtered on truthiness while `_schema_violations` filtered on
+    `value.strip()`, so a `User-Agent: " "` was *present* to the builder and *empty* to the
+    verifier: HTTP 200, record written, `--verify` exit 1 on `field=user_agent — present but
+    empty`. That is worse than it sounds because `verify_paths` verifies a SET — one
+    whitespace row makes the whole day-file or table fail until a human deletes it, and the
+    row is caller-triggerable without authentication (2026-08-02 gate, week4-day1).
+
+    Whitespace-only is therefore ABSENT, not empty: the field is dropped and the record
+    simply does not claim to know that thing. Note the asymmetry that is deliberate — this
+    decides *whether* to keep a value, never *what* the value is. A user agent is verbatim
+    caller text (`"  Mozilla/5.0  "` is stored with its spaces); nothing here strips.
+    """
+    return bool(value and value.strip())
+
+
 def hash_client(address: str | None, *, salt: str) -> str | None:
     """Salted SHA-256 of a client address. The ONLY form in which it is ever stored.
 
@@ -156,7 +179,7 @@ def requester_context(
         "user_agent": user_agent,
         "client_hash": client_hash,
     }
-    present = {key: value for key, value in fields.items() if value}
+    present = {key: value for key, value in fields.items() if is_present(value)}
     token = _REQUESTER.set(present or None)
     try:
         yield
@@ -217,7 +240,7 @@ def build_record(
     requester = current_requester() or {}
     for field in REQUESTER_FIELDS:
         value = requester.get(field)
-        if value:
+        if is_present(value):
             record[field] = value
     return record
 
@@ -380,7 +403,7 @@ def _schema_violations(rec: dict, where: str) -> list[Violation]:
             )
     for field in ("question", "model"):
         value = expect(rec, field, (str,), field)
-        if value is not None and not value.strip():
+        if value is not None and not is_present(value):
             out.append(Violation(where, field, "empty — a record with no {} documents nothing".format(field)))
     k = expect(rec, "k", (int,), "k")
     if k is not None and k < 1:
@@ -389,11 +412,14 @@ def _schema_violations(rec: dict, where: str) -> list[Violation]:
     # Requester fields are OPTIONAL (absent for eval/CLI/test runs, present for HTTP answers),
     # but present-and-empty is not a third state: it would be a record asserting it knows who
     # asked while carrying nothing. `build_record` never emits that; `--verify` refuses it.
+    # That sentence is true BY CONSTRUCTION and not by coincidence: both halves call the same
+    # `is_present` below, which is the whole point of it being a function (see its docstring —
+    # it was two predicates once, and a whitespace-only User-Agent slipped between them).
     for field in REQUESTER_FIELDS:
         if field not in rec:
             continue
         value = expect(rec, field, (str,), field)
-        if value is not None and not value.strip():
+        if value is not None and not is_present(value):
             out.append(Violation(where, field, "present but empty — omit the field instead"))
 
     retrieved = expect(rec, "retrieved", (list,), "retrieved")
