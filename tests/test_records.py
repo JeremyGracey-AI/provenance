@@ -186,17 +186,24 @@ def test_a_blank_answer_is_recorded_and_verifies_on_purpose(tmp_path):
 # dispatch the way to honour it. These are that constraint as tests.
 # --------------------------------------------------------------------------------------
 
-_REPO_V1_RECORD = Path(__file__).resolve().parents[1] / "records" / "answers" / "answers-2026-08-02.jsonl"
+_REPO_V1_RECORD = Path(__file__).resolve().parent / "fixtures" / "v1-record-2026-08-02.jsonl"
 
 
 def test_the_v1_record_committed_to_this_repository_still_verifies():
-    """THE regression gate for ruling 7, run against the real file rather than a fixture.
+    """THE regression gate for ruling 7, run against a real v1 record rather than a synthetic one.
 
-    `records/answers/answers-2026-08-02.jsonl` was written on 2026-08-02 by a build that had no
-    `answer` field and no `record_version` but 1. If the version bump had been done as equality
-    (`record_version != RECORD_VERSION`), or the v2 requirements applied unconditionally, this
-    file — the only decision record this repository actually ships — would fail its own
-    verifier. Asserted through `records.main`, the CLI's own entry point."""
+    This file is a byte copy of `records/answers/answers-2026-08-02.jsonl`, genuinely written
+    on 2026-08-02 by a build that had no `answer` field and no `record_version` but 1 — not a
+    v2 record relabelled, which the assertions below check. If the version bump had been done
+    as equality (`record_version != RECORD_VERSION`), or the v2 requirements applied
+    unconditionally, it would fail its own verifier. Asserted through `records.main`, the CLI's
+    own entry point.
+
+    It lives under `tests/fixtures/` and NOT at its original path because `records/` is
+    gitignored (".gitignore:17 — runtime artifacts, never committed"). The test's own name said
+    "committed to this repository" while reading a file no clone has: it passed on the author's
+    machine and failed on CI's fresh checkout (run #11, 2026-08-03). A back-compat guarantee
+    verified only where the artifact happens to linger is not a guarantee."""
     assert _REPO_V1_RECORD.exists(), _REPO_V1_RECORD
     rec = json.loads([ln for ln in records._read_record_lines(_REPO_V1_RECORD) if ln.strip()][0])
     assert rec["record_version"] == 1
