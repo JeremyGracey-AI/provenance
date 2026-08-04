@@ -190,13 +190,25 @@ _SUPPORTED_RECORD_VERSIONS = (1, 2)
 
 _VERDICTS = ("supported", "unsupported")
 
-# `build_record` mints `uuid.uuid4().hex`, and the schema above says so. The verifier now says
+# `new_run_id` mints `uuid.uuid4().hex`, and the schema above says so. The verifier now says
 # it too (2026-08-03 invigilation, defect 12: `run_id` was type-checked only, so
 # `"../../etc/passwd"` verified clean). This is SCHEMA HYGIENE, not a traversal fix — nothing
 # in this repo builds a path from `run_id` (`JsonlSink` derives its day-file from `timestamp`,
 # `_collect_files` from the CLI argument) — but a field documented as a uuid4 hex should be
 # one, and the store makes it a primary key.
 _RUN_ID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
+
+
+def new_run_id() -> str:
+    """Mint one run id. The ONE place the format `_RUN_ID_RE` enforces is produced.
+
+    It exists because there are now two callers: `build_record` (which stamps the record) and
+    `Pipeline.run` (which needs the same id BEFORE the record exists, so the one log line it
+    writes joins to the record instead of quoting the caller's question). Two `uuid.uuid4().hex`
+    spellings would be a fork of exactly the shape `is_present` was made a function to close —
+    the same value produced in two places, free to drift when one of them changes.
+    """
+    return uuid.uuid4().hex
 
 # A record cannot predate the repository that writes it: first commit 296feb9, 2026-05-28.
 # This is the floor that rejects the crafted year-0001 stamp (defect 12). There is deliberately
@@ -386,6 +398,7 @@ def build_record(
     settings: "Settings",
     trace: "Trace",
     verify_fallbacks: list[bool],
+    run_id: str | None = None,
 ) -> dict:
     """Assemble a `RECORD_VERSION` dict from the state `Pipeline.run` already holds.
 
@@ -399,6 +412,11 @@ def build_record(
 
     Both come from the `GroundedAnswer` this function is already handed; nothing new is
     computed here and `Pipeline.run`'s signature is untouched.
+
+    `run_id` is OPTIONAL and defaults to a freshly minted one, so every existing caller is
+    unchanged. `Pipeline.run` passes the id it already logged, which is what makes the platform
+    log line and the record two views of the same run rather than two unrelated facts. Passing
+    one in never weakens the record: `_schema_violations` holds it to `_RUN_ID_RE` either way.
     """
     flags = list(verify_fallbacks)
     claims = []
@@ -417,7 +435,7 @@ def build_record(
         )
     record = {
         "record_version": RECORD_VERSION,
-        "run_id": uuid.uuid4().hex,
+        "run_id": run_id or new_run_id(),
         "timestamp": datetime.now().astimezone().isoformat(),
         "question": answer.question,
         # The served prose, verbatim. `question` is what was asked and this is what was said;
