@@ -281,10 +281,12 @@ def is_present(value: str | None) -> bool:
         caller-reachable) is FIXED, on the reader, by the `[human]` ruling of 2026-08-02 —
         see `_read_record_lines`.
 
-    What remains undoored, named so nobody has to rediscover it: `retrieved[].id` (built from
-    the committed corpus manifest — whoever ships a corpus) and `trace[].detail` values (built
-    by this repo's own graph nodes from ints). Neither is caller- or model-reachable, and both
-    would be rejected here if they ever carried a blank or a NUL.
+    What remains undoored, named so nobody has to rediscover it, and one of the two is
+    DEMONSTRATED: a corpus `doc_id` carrying a NUL gives HTTP 200 and a record that fails
+    `--verify` on `field=retrieved[0].id` whenever no citation resolves to that page (WEEK-5
+    Day 1, reproduced in-process, left open as a corpus-shipper path). `trace[].detail` values
+    are built by this repo's own graph nodes from ints and are not reachable from outside this
+    source tree. Neither is caller- or model-reachable.
     """
     return bool(value and value.strip())
 
@@ -784,8 +786,10 @@ def _nul_violations(node: object, where: str, path: str = "") -> list[Violation]
                     f"at 502 with no record written (ruling 8), which covers `answer`, "
                     f"`claims[].text`, `claims[].evidence` and `claims[].citations`. Operator-"
                     f"supplied `model` is refused by `Settings` at construction (WEEK-5 Day 1). "
-                    f"A record failing here was therefore not produced by this API at a 200: it "
-                    f"was hand-written, written by an older build, or written straight to a sink",
+                    f"`retrieved[].id` still has NO door: it is built from the corpus manifest, "
+                    f"so a `doc_id` carrying a NUL is a 200 and this failure whenever no "
+                    f"citation resolves (demonstrated, WEEK-5 Day 1; corpus-shipper path, "
+                    f"never caller- or model-reachable)",
                 )
             )
     elif isinstance(node, dict):

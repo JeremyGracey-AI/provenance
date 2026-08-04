@@ -53,10 +53,17 @@ doors below; anything larger has to be earned by an argument nobody has made yet
     `records._read_record_lines`, by `[human]` ruling.
   * CLOSED — the model-output NUL, by ruling 8, as described above.
 
-Still with no door, stated so the next person does not have to find them: `retrieved[].id`
-(built from the committed corpus manifest, reachable only by whoever ships a corpus) and
-`trace[].detail` values (built by this repo's own nodes from ints). Neither is caller- or
-model-reachable today; both would fail `--verify` if they ever carried a NUL.
+STILL WITH NO DOOR, and one of them is DEMONSTRATED rather than hypothesised, so the sentence
+above stays narrow:
+
+  * `retrieved[].id` — built from the corpus manifest. A `doc_id` carrying a NUL is HTTP 200
+    with a record that fails `--verify` on `field=retrieved[0].id`, whenever no citation
+    resolves to it (when one does, the model door catches it as `claims[0].citations[0]`,
+    which is why this needs the no-citation case to see). Reproduced in-process, WEEK-5 Day 1,
+    and NOT fixed there: it is a corpus-shipper path, never caller- or model-reachable, and it
+    is named here rather than closed quietly.
+  * `trace[].detail` values — built by this repo's own graph nodes from ints. Not demonstrated
+    and not reachable by anyone outside this source tree.
 """
 
 from __future__ import annotations
