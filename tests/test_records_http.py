@@ -22,12 +22,15 @@ Three properties dominate this file, and all three are guarantees rather than fe
     `CaptureSink` and pinned `_settings`.
 
     This bullet said "a 200 never leaves an unverifiable record" until 2026-08-02, when a gate
-    refuted that by command. The narrower sentence above is what the tests actually establish.
-    The difference, named rather than left implied:
-      - OPEN: `model` is checked by the same predicate but has NO door. `Settings.vlm_model` is
-        unconstrained, so an OPERATOR (never a caller) can set it blank and get HTTP 200 with a
-        record `--verify` rejects: `FAIL ... field=model — empty`. Not tested here, because it
-        is not fixed here — it is carried as a config-policy decision.
+    refuted that by command. The narrower sentence above is what the tests in THIS file
+    establish; the refutations are closed elsewhere and are named here so the split is legible:
+      - CLOSED (`tests/test_settings_vlm_model.py`): `model` is checked by the same predicate
+        and now has a door. `Settings.vlm_model` was unconstrained, so an OPERATOR (never a
+        caller) could set it blank and get HTTP 200 with a record `--verify` rejects:
+        `FAIL ... field=model — empty`. `Settings` refuses it at construction.
+      - CLOSED (`tests/test_model_output_door.py`): a NUL in `answer`, `claims[].text` or
+        `claims[].evidence` was HTTP 200 with a record `--verify` rejects. `[human]` ruling 8
+        put a door at the answerer seam; it is now 502 with no record written.
       - CLOSED: the caller-reachable refutation — U+2028 / U+2029 / U+0085 written raw by
         `ensure_ascii=False` and read back with `str.splitlines()` — is fixed on the reader and
         pinned at the bottom of this file by

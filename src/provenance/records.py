@@ -264,21 +264,27 @@ def is_present(value: str | None) -> bool:
     and the verifier's in the same process.)
 
     What is NOT proved — and what this docstring claimed until 2026-08-02 — is that a 200 can
-    never leave a record `--verify` rejects. A gate refuted that sentence by command, and one
-    of the two refutations is still open:
+    never leave a record `--verify` rejects. A gate refuted that sentence by command. Both of
+    its refutations are now closed, and the sentence above STILL does not widen: the guarantee
+    is about this predicate, and a defect that gets fixed is not evidence the claim was ever
+    bigger than one predicate.
 
-      * `model` is checked with `is_present` below and has NO door. `Settings.vlm_model` is
-        unconstrained (`config.py`) and `build_record` copies it into every record, so
-        `vlm_model=" "` is HTTP 200 and then `FAIL ... field=model — empty`. KNOWN AND OPEN,
-        stated as what it is: an OPERATOR-MISCONFIGURATION path, reachable only by whoever
-        controls the deployment's environment, never by a caller. Carried to Day 5 —
-        constraining it (reject at `Settings`? default on blank? refuse to build the record?)
-        is a config-policy decision rather than a bug fix.
+      * `model` is checked with `is_present` below, and now has a door of its own.
+        `Settings.vlm_model` was unconstrained (`config.py`) while `build_record` copied it
+        into every record, so `vlm_model=" "` was HTTP 200 and then
+        `FAIL ... field=model — empty`. CLOSED by WEEK-5 Day 1: `Settings` rejects it at
+        construction, with this predicate, so the process refuses to start rather than serving
+        answers whose records cannot be verified. It was always an OPERATOR-MISCONFIGURATION
+        path — reachable only by whoever controls the deployment's environment, never by a
+        caller — which is why it outlived two doors aimed at callers.
       * The JSONL line-break split (U+2028 / U+2029 / U+0085, unauthenticated and
         caller-reachable) is FIXED, on the reader, by the `[human]` ruling of 2026-08-02 —
-        see `_read_record_lines`. It is named here so the history is legible, not as a live
-        gap, and it does not license widening the sentence above: it was a defect that got
-        closed, not evidence that the claim was ever bigger than one predicate.
+        see `_read_record_lines`.
+
+    What remains undoored, named so nobody has to rediscover it: `retrieved[].id` (built from
+    the committed corpus manifest — whoever ships a corpus) and `trace[].detail` values (built
+    by this repo's own graph nodes from ints). Neither is caller- or model-reachable, and both
+    would be rejected here if they ever carried a blank or a NUL.
     """
     return bool(value and value.strip())
 
@@ -777,9 +783,9 @@ def _nul_violations(node: object, where: str, path: str = "") -> list[Violation]
                     f"`protocols.check_answer`/`check_verdict` reject NUL-bearing MODEL output "
                     f"at 502 with no record written (ruling 8), which covers `answer`, "
                     f"`claims[].text`, `claims[].evidence` and `claims[].citations`. Operator-"
-                    f"supplied `model` has no NUL door — see WEEK-5 Day 1. A record failing "
-                    f"here was therefore not produced by this API at a 200: it was hand-written, "
-                    f"written by an older build, or written straight to a sink",
+                    f"supplied `model` is refused by `Settings` at construction (WEEK-5 Day 1). "
+                    f"A record failing here was therefore not produced by this API at a 200: it "
+                    f"was hand-written, written by an older build, or written straight to a sink",
                 )
             )
     elif isinstance(node, dict):

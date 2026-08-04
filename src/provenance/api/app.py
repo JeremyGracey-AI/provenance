@@ -35,16 +35,19 @@ put that door at the answerer: `protocols.check_answer` / `check_verdict`, appli
 predicate (`records.is_nul_free`), so there is still exactly one definition of the rule across
 the query door, the model door, and the verifier.
 
-It is NOT true that a 200 can never leave behind a record its own verifier rejects. That larger
-sentence stood here until 2026-08-02 and a gate refuted it by command. The refutations, all
-named rather than implied:
+That larger sentence — "a 200 can never leave behind a record its own verifier rejects" —
+stood here until 2026-08-02 and a gate refuted it by command. Every refutation known to that
+gate is now closed, and the sentence is STILL not restored: it was refuted twice, the class of
+defect is "some field has a definition on one side and none on the other", and no test
+enumerates the fields. What is claimed is the per-predicate guarantee above plus the three
+doors below; anything larger has to be earned by an argument nobody has made yet.
 
-  * OPEN — `Settings.vlm_model` is unconstrained (`config.py`), `records.build_record` copies it
-    into every record, and `--verify` checks it with `is_present`. `vlm_model=" "` -> HTTP 200
-    -> `FAIL ... field=model — empty`, exit 1. This is an OPERATOR-MISCONFIGURATION path: it
-    needs whoever controls the deployment's environment, never a caller, which is the whole
-    difference between it and the defects the doors above close. Carried, not fixed here —
-    constraining it is a config-policy decision.
+  * CLOSED — `Settings.vlm_model` was unconstrained (`config.py`), `records.build_record`
+    copied it into every record, and `--verify` checks it with `is_present`: `vlm_model=" "`
+    -> HTTP 200 -> `FAIL ... field=model — empty`, exit 1. `Settings` now refuses it at
+    construction, on the same predicate. An OPERATOR-MISCONFIGURATION path — it needs whoever
+    controls the deployment's environment, never a caller — which is why it outlived two doors
+    aimed at callers.
   * CLOSED — the JSONL line-break split (a caller's U+2028 / U+2029 / U+0085 written raw and
     read back with `str.splitlines()`) is fixed on the reader, in
     `records._read_record_lines`, by `[human]` ruling.
