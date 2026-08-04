@@ -772,10 +772,14 @@ def _nul_violations(node: object, where: str, path: str = "") -> list[Violation]
                     # verifier that crashes instead of reporting.
                     f"contains U+0000 at index {node.find(NUL)} ({_excerpt(node)}) — "
                     f"PostgreSQL text/jsonb cannot represent a NUL, so this record cannot be "
-                    f"stored. Only `question` has a door: `QueryRequest` rejects a NUL query "
-                    f"at 422 (api/app.py). Model-supplied strings (`answer`, `claims[].text`, "
-                    f"`claims[].evidence`) and operator-supplied `model` have NO door, so this "
-                    f"violation is reachable at an HTTP 200 — see WEEK-4 `## Next`",
+                    f"stored. Two doors now stand in front of this rule, on the same predicate: "
+                    f"`QueryRequest` rejects a NUL query at 422 (api/app.py, ruling 6) and "
+                    f"`protocols.check_answer`/`check_verdict` reject NUL-bearing MODEL output "
+                    f"at 502 with no record written (ruling 8), which covers `answer`, "
+                    f"`claims[].text`, `claims[].evidence` and `claims[].citations`. Operator-"
+                    f"supplied `model` has no NUL door — see WEEK-5 Day 1. A record failing "
+                    f"here was therefore not produced by this API at a 200: it was hand-written, "
+                    f"written by an older build, or written straight to a sink",
                 )
             )
     elif isinstance(node, dict):

@@ -26,19 +26,34 @@ string. Both halves shipped in one commit by `[human]` ruling 6: the verifier ru
 have re-created the fork the paragraph above is about, a 200 producing a record its own
 verifier rejects.
 
+That query door was only ONE of the ways a NUL reached a record. Model output had none, so a
+NUL in `answer`, `claims[].text` or `claims[].evidence` was a 200 with a record `--verify`
+rejects — reproduced over a real uvicorn/h11 socket on all three fields. `[human]` ruling 8
+put that door at the answerer: `protocols.check_answer` / `check_verdict`, applied in
+`graph.py`'s answer and verify nodes, raising `MalformedModelOutput`, which
+`malformed_model_output` below renders as **502 with no record written**. Same shared
+predicate (`records.is_nul_free`), so there is still exactly one definition of the rule across
+the query door, the model door, and the verifier.
+
 It is NOT true that a 200 can never leave behind a record its own verifier rejects. That larger
-sentence stood here until 2026-08-02 and a gate refuted it by command; one refutation is closed
-and one is open, and both are named rather than implied:
+sentence stood here until 2026-08-02 and a gate refuted it by command. The refutations, all
+named rather than implied:
 
   * OPEN — `Settings.vlm_model` is unconstrained (`config.py`), `records.build_record` copies it
     into every record, and `--verify` checks it with `is_present`. `vlm_model=" "` -> HTTP 200
     -> `FAIL ... field=model — empty`, exit 1. This is an OPERATOR-MISCONFIGURATION path: it
     needs whoever controls the deployment's environment, never a caller, which is the whole
-    difference between it and the two defects the door now closes. Carried, not fixed here —
+    difference between it and the defects the doors above close. Carried, not fixed here —
     constraining it is a config-policy decision.
   * CLOSED — the JSONL line-break split (a caller's U+2028 / U+2029 / U+0085 written raw and
     read back with `str.splitlines()`) is fixed on the reader, in
     `records._read_record_lines`, by `[human]` ruling.
+  * CLOSED — the model-output NUL, by ruling 8, as described above.
+
+Still with no door, stated so the next person does not have to find them: `retrieved[].id`
+(built from the committed corpus manifest, reachable only by whoever ships a corpus) and
+`trace[].detail` values (built by this repo's own nodes from ints). Neither is caller- or
+model-reachable today; both would fail `--verify` if they ever carried a NUL.
 """
 
 from __future__ import annotations
@@ -48,12 +63,14 @@ import uuid
 from typing import Annotated
 
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from pydantic import AfterValidator, BaseModel, Field
 
 from provenance import records
 from provenance.config import Settings
 from provenance.models import GroundedAnswer
 from provenance.pipeline import Pipeline
+from provenance.protocols import MalformedModelOutput
 
 _MAX_USER_AGENT = 300
 
@@ -170,6 +187,38 @@ def create_app(pipeline: Pipeline, *, settings: Settings | None = None) -> FastA
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.exception_handler(MalformedModelOutput)
+    def malformed_model_output(request: Request, exc: MalformedModelOutput) -> JSONResponse:
+        """The model-output door's HTTP face: 502, no record, no answer (`[human]` ruling 8).
+
+        502 rather than 500: the fault is a response from an upstream service, and an
+        unhandled exception would render as a bare `Internal Server Error` that says nothing
+        an operator can act on. 502 rather than 422: the caller's request was fine.
+
+        The body names the FIELD PATH and the `run_id` and NEVER the offending value. The path
+        (`claims[0].evidence`) is the same one `--verify` would print for the record this run
+        did not write, so a caller's bug report and a verifier FAIL line say the same words.
+        The value is withheld on purpose: it is model output over a caller-chosen question
+        (the PII surface `[human]` ruling 7 named) and it carries a control character by
+        construction. `run_id` is safe — it is server-minted (`records.new_run_id`), it is the
+        id the WARNING in `Pipeline.run` logged, and it is the join key for a run that
+        deliberately left no record.
+        """
+        return JSONResponse(
+            status_code=502,
+            content={
+                "detail": {
+                    "error": "malformed_model_output",
+                    "field": exc.field,
+                    "run_id": exc.run_id,
+                    "message": (
+                        "the model returned a value the record store cannot represent; "
+                        "no answer was served and no record was written"
+                    ),
+                }
+            },
+        )
 
     # Sync def → FastAPI runs it in a worker thread, so the blocking Cohere/Anthropic
     # calls inside the pipeline don't stall the event loop. The ContextVar set below is

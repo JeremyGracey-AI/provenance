@@ -17,7 +17,7 @@ from langgraph.graph import END, START, StateGraph
 
 from provenance.config import Settings
 from provenance.models import Answer, PageRef, VerifiedClaim
-from provenance.protocols import Answerer, Judge, Retriever, Router
+from provenance.protocols import Answerer, Judge, Retriever, Router, check_answer, check_verdict
 from provenance.tracing import Trace
 
 logger = logging.getLogger("provenance")
@@ -49,17 +49,24 @@ def build_graph(
 
     def answer(state: GraphState) -> dict:
         with state["trace"].span("answer", repair=state["repairs"]):
-            return {"answer": answerer.answer(state["query"], state["pages"], state.get("feedback"))}
+            # `check_answer` is the model-output door (`[human]` ruling 8, option (a)). This is
+            # the ONE call site where an `Answerer`'s output enters the system, so checking it
+            # here covers every implementation instead of one backend. It returns the object
+            # unchanged or raises `MalformedModelOutput` — never rewrites.
+            drafted = answerer.answer(state["query"], state["pages"], state.get("feedback"))
+            return {"answer": check_answer(drafted)}
 
     def verify(state: GraphState) -> dict:
         pages_by_id = {page.id: page for page in state["pages"]}
         with state["trace"].span("verify", claims=len(state["answer"].claims)):
             verified: list[VerifiedClaim] = []
             fallbacks: list[bool] = []  # per claim: no citation resolved → judge saw ALL pages
-            for claim in state["answer"].claims:
+            for i, claim in enumerate(state["answer"].claims):
                 cited = [pages_by_id[c] for c in claim.citations if c in pages_by_id]
                 fallbacks.append(not cited)
-                verified.append(judge.verify(claim, cited or state["pages"]))
+                # The judge's half of the same door; `i` is the claim index the record will
+                # use, so the refusal names `claims[i].evidence` exactly as `--verify` would.
+                verified.append(check_verdict(judge.verify(claim, cited or state["pages"]), i))
         supported = sum(1 for v in verified if v.verdict == "supported")
         confidence = supported / len(verified) if verified else 0.0
         return {"verified": verified, "confidence": confidence, "verify_fallbacks": fallbacks}

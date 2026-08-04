@@ -12,7 +12,7 @@ import sys
 from provenance.config import Settings
 from provenance.graph import build_graph
 from provenance.models import GroundedAnswer
-from provenance.protocols import Answerer, Judge, Retriever, Router
+from provenance.protocols import Answerer, Judge, MalformedModelOutput, Retriever, Router
 from provenance.records import RecordSink, build_record, new_run_id
 from provenance.tracing import Trace
 
@@ -39,6 +39,13 @@ class Pipeline:
     asked. `tests/test_pipeline_logging.py` asserts it against a CAPTURED LOG with
     `basicConfig(level=INFO)` installed — without that the assertion would pass on the
     unfixed tree and prove nothing.
+
+    A RUN CAN NOW REFUSE. `graph.py`'s answer and verify nodes apply the model-output door
+    (`protocols.check_answer` / `check_verdict`, `[human]` ruling 8), so a backend that hands
+    back a string the record store cannot hold raises `MalformedModelOutput` out of
+    `graph.invoke`. That path writes NO record and returns no answer — the API renders it as
+    502. `build_record` therefore stays total: it is never asked to decide whether to drop a
+    field or a record, which was the whole argument for option (a) over option (b).
     """
 
     def __init__(self, graph, settings: Settings, record_sink: RecordSink | None = None) -> None:
@@ -52,7 +59,22 @@ class Pipeline:
         # the record built from it, and (Day 1 item 1) the refusal raised out of `graph.invoke`
         # when a backend hands back a string the store cannot hold.
         run_id = new_run_id()
-        final = self._graph.invoke({"query": query, "repairs": 0, "feedback": None, "trace": trace})
+        try:
+            final = self._graph.invoke(
+                {"query": query, "repairs": 0, "feedback": None, "trace": trace}
+            )
+        except MalformedModelOutput as exc:
+            # The model-output door fired inside a graph node (`[human]` ruling 8). Two things
+            # happen here and nothing else: the run is NAMED on the exception so the API's 502
+            # can quote it, and one WARNING is emitted so a refused run is not a silent hole in
+            # the log — a rejected answer writes no record, so this line is the only trace it
+            # ever leaves. The FIELD PATH is logged; the VALUE never is. It is model output over
+            # a caller's question (the PII surface `[human]` ruling 7 named) and it contains a
+            # control character by construction, which is the log-forgery shape `_log_token`
+            # exists to prevent one layer down.
+            exc.run_id = run_id
+            logger.warning("run %s refused: malformed model output at %s", run_id, exc.field)
+            raise
         logger.info("run %s -> %s", run_id, trace.summary())
         grounded = GroundedAnswer(
             question=query,
