@@ -1,14 +1,14 @@
 """HostedVLM tool-use parsing + image-block logic without calling Anthropic.
 
 We monkeypatch `anthropic.Anthropic`; the fake returns a `tool_use` block whose `.input` is the
-structured payload, chosen by the forced tool name — so one fake serves both answer and verify.
+structured payload, chosen by the offered tool's name — so one fake serves both answer and verify.
 Using tool-use (not free-text JSON) is what makes evidence containing literal quotes safe.
 """
 
 import anthropic
 import pytest
 
-from provenance.backends.vlm import HostedVLM, _image_block, _resolve_citation
+from provenance.backends.vlm import HostedVLM, _image_block, _resolve_citation, _thinking_for
 from provenance.config import Settings
 from provenance.models import Claim, PageRef
 
@@ -38,7 +38,7 @@ class _Messages:
         self._verdict_payload = verdict_payload
 
     def create(self, *, system, messages, tools, tool_choice, **kwargs):
-        is_verdict = tool_choice["name"] == "submit_verdict"
+        is_verdict = tools[0]["name"] == "submit_verdict"
         return _Response(self._verdict_payload if is_verdict else _ANSWER_INPUT)
 
 
@@ -123,3 +123,59 @@ def test_answer_resolves_short_citations(monkeypatch):
     pages = [PageRef(doc_id="anatomy-physiology-2e", page_number=267, score=1.0, image_url="https://x/a_p267.png")]
     answer = vlm.answer("Which bones form the orbit?", pages)
     assert answer.claims[0].citations == ["anatomy-physiology-2e#p267"]
+
+
+def _recording_vlm(monkeypatch, model: str):
+    """A HostedVLM whose fake SDK records the kwargs of every `messages.create` call."""
+    calls: list[dict] = []
+
+    class _Recording:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            is_verdict = kwargs["tools"][0]["name"] == "submit_verdict"
+            return _Response(_VERDICT_INPUT if is_verdict else _ANSWER_INPUT)
+
+    monkeypatch.setattr(anthropic, "Anthropic", lambda *a, **k: type("C", (), {"messages": _Recording()})())
+    return HostedVLM(Settings(vlm_model=model)), calls
+
+
+def test_sonnet_5_5_requests_offer_the_tool_instead_of_forcing_it(monkeypatch):
+    # Claude Sonnet 5.5 rejects a forced tool_choice ({"type": "tool"} / {"type": "any"}) with a
+    # 400 on every request. So the tool is offered (auto) and strict, and up-front thinking is off.
+    vlm, calls = _recording_vlm(monkeypatch, "claude-sonnet-5-5")
+    pages = [PageRef(doc_id="d", page_number=12, score=1.0, image_url="https://x/d_p12.png")]
+    vlm.verify(vlm.answer("How many tissue types?", pages).claims[0], pages)
+    assert [c["tools"][0]["name"] for c in calls] == ["submit_answer", "submit_verdict"]
+    for call in calls:
+        assert call["tool_choice"] == {"type": "auto"}
+        assert call["tools"][0]["strict"] is True
+        assert call["tools"][0]["input_schema"]["additionalProperties"] is False
+        assert call["thinking"] == {"type": "between_tools"}
+
+
+def test_older_models_get_no_thinking_setting(monkeypatch):
+    # `between_tools` is Sonnet 5.5-only; claude-sonnet-4-6 must keep working as an env rollback.
+    assert _thinking_for("claude-sonnet-4-6") is None
+    vlm, calls = _recording_vlm(monkeypatch, "claude-sonnet-4-6")
+    pages = [PageRef(doc_id="d", page_number=12, score=1.0, image_url="https://x/d_p12.png")]
+    vlm.answer("How many tissue types?", pages)
+    assert "thinking" not in calls[0]
+    assert calls[0]["tool_choice"] == {"type": "auto"}
+
+
+def test_reply_without_a_tool_call_raises(monkeypatch):
+    # With tool_choice auto the model *can* answer in prose. That must fail loudly, never
+    # come back as an empty answer.
+    class _TextBlock:
+        type = "text"
+        text = "The pages describe four tissue types."
+
+    class _Msgs:
+        def create(self, **kwargs):
+            return type("R", (), {"content": [_TextBlock()], "stop_reason": "end_turn"})()
+
+    monkeypatch.setattr(anthropic, "Anthropic", lambda *a, **k: type("C", (), {"messages": _Msgs()})())
+    vlm = HostedVLM(Settings(vlm_model="claude-sonnet-5-5"))
+    pages = [PageRef(doc_id="d", page_number=12, score=1.0, image_url="https://x/d_p12.png")]
+    with pytest.raises(RuntimeError, match="did not call submit_answer"):
+        vlm.answer("How many tissue types?", pages)

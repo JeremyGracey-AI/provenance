@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     # Secrets / model selection.
     anthropic_api_key: str | None = None  # falls back to the SDK's ANTHROPIC_API_KEY if unset
     cohere_api_key: str | None = None
-    vlm_model: str = "claude-sonnet-4-6"  # current vision-capable Claude; see Anthropic's model list
+    vlm_model: str = "claude-sonnet-5-5"  # current vision-capable Claude; see Anthropic's model list
 
     @field_validator("vlm_model")
     @classmethod

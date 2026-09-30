@@ -209,7 +209,7 @@ def _hosted(monkeypatch, answer_payload, verdict_payload) -> HostedVLM:
 
     class _Messages:
         def create(self, *, system, messages, tools, tool_choice, **kwargs):
-            is_verdict = tool_choice["name"] == "submit_verdict"
+            is_verdict = tools[0]["name"] == "submit_verdict"
             return _Response(verdict_payload if is_verdict else answer_payload)
 
     monkeypatch.setattr(

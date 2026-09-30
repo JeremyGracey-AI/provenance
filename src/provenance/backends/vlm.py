@@ -5,15 +5,20 @@ claims it makes, each citing the page id(s) it drew on. `HostedVLM.verify` re-re
 page(s) and decides whether a single claim is actually supported, quoting the evidence span.
 Passing the same instance as both answerer and judge keeps the demo to one model.
 
-Structured output uses Anthropic tool-use with a forced `tool_choice`: the model fills a JSON
-schema and the SDK hands back a validated dict. This is deliberate — the judge quotes page text
-verbatim as `evidence`, and textbook prose routinely contains literal double-quotes (e.g. the
-"fight-or-flight" response). Parsing that out of free-text JSON broke on the unescaped quotes;
-tool inputs carry them safely.
+Structured output uses Anthropic tool-use: the model fills a JSON schema and the SDK hands back
+a dict. This is deliberate — the judge quotes page text verbatim as `evidence`, and textbook
+prose routinely contains literal double-quotes (e.g. the "fight-or-flight" response). Parsing
+that out of free-text JSON broke on the unescaped quotes; tool inputs carry them safely.
+
+The tool is OFFERED, not forced. Claude Sonnet 5.5 (the default model since 2026-09-29) rejects
+a forced `tool_choice` ({"type": "tool"} or {"type": "any"}) with a 400 on every request, so
+each call sends `tool_choice={"type": "auto"}`, marks the tool `strict` (grammar-constrained
+inputs: a call that does happen always matches the schema), and the system prompt says to call
+it. A reply with no tool call still raises in `_run_tool` — a visible failure, never an empty
+answer. Anthropic's Sonnet 5.5 migration note recommends exactly this pairing.
 
 Images are sent as URL sources (Anthropic fetches them); a local `image_path` is sent as
-base64 when no URL is set (the bundled-subset build path). Verified against anthropic==0.105:
-`source.type == "url"` and forced `tool_choice` are both supported.
+base64 when no URL is set (the bundled-subset build path).
 """
 
 from __future__ import annotations
@@ -31,19 +36,22 @@ _ANSWER_SYSTEM = (
     "provided. Decompose your answer into discrete, individually checkable claims, and cite the "
     "page id(s) that support each claim using the bracketed ids shown above each image. Each "
     "claim must be a single self-contained sentence. If the pages do not contain the answer, say "
-    "so plainly in the answer and return no claims. Call the submit_answer tool with your response."
+    "so plainly in the answer and return no claims. Always respond by calling the submit_answer "
+    "tool, never in plain text."
 )
 
 _JUDGE_SYSTEM = (
     "You are a strict fact-checker. Decide whether the CLAIM is directly and fully supported by "
     "the page image(s) shown. Quote the exact supporting text from the page as evidence. If the "
     "claim is not supported, or only partially supported, return verdict 'unsupported' with an "
-    "empty evidence string. Call the submit_verdict tool with your verdict."
+    "empty evidence string. Always respond by calling the submit_verdict tool, never in plain "
+    "text."
 )
 
 _ANSWER_TOOL = {
     "name": "submit_answer",
     "description": "Submit the grounded answer and the discrete claims that compose it.",
+    "strict": True,  # grammar-constrained inputs; strict schemas need additionalProperties: False
     "input_schema": {
         "type": "object",
         "properties": {
@@ -62,16 +70,19 @@ _ANSWER_TOOL = {
                         },
                     },
                     "required": ["text", "citations"],
+                    "additionalProperties": False,
                 },
             },
         },
         "required": ["answer", "claims"],
+        "additionalProperties": False,
     },
 }
 
 _VERIFY_TOOL = {
     "name": "submit_verdict",
     "description": "Report whether the claim is fully supported by the page image(s).",
+    "strict": True,
     "input_schema": {
         "type": "object",
         "properties": {
@@ -82,8 +93,25 @@ _VERIFY_TOOL = {
             },
         },
         "required": ["verdict", "evidence"],
+        "additionalProperties": False,
     },
 }
+
+
+def _thinking_for(model: str) -> dict | None:
+    """The `thinking` setting to send for `model`, or None to send none at all.
+
+    Claude Sonnet 5.5 thinks before it answers by default, and thinking tokens count against
+    `max_tokens`. The judge gets `judge_max_tokens` (512 by default), so up-front thinking can
+    spend the whole budget before the tool call is written. `between_tools` turns up-front
+    thinking off: the closest match to how claude-sonnet-4-6 ran this pipeline. Older models
+    reject that value, so only Sonnet 5.5 gets it; every other model keeps its provider default,
+    which is exactly what this code sent before (nothing). That keeps
+    `PROVENANCE_VLM_MODEL=claude-sonnet-4-6` a working rollback with no code change.
+    """
+    if model.startswith("claude-sonnet-5-5"):
+        return {"type": "between_tools"}
+    return None
 
 
 def _image_block(page: PageRef) -> dict:
@@ -131,14 +159,19 @@ class HostedVLM:
         self._judge_max_tokens = settings.judge_max_tokens
 
     def _run_tool(self, system: str, content: list[dict], tool: dict, max_tokens: int) -> dict:
-        """Force the model to call `tool` and return its validated input as a dict."""
+        """Offer `tool`, require that the model called it, and return its input as a dict."""
+        extra: dict = {}
+        thinking = _thinking_for(self._model)
+        if thinking is not None:
+            extra["thinking"] = thinking
         response = self._client.messages.create(
             model=self._model,
             max_tokens=max_tokens,
             system=system,
             tools=[tool],
-            tool_choice={"type": "tool", "name": tool["name"]},
+            tool_choice={"type": "auto"},  # Sonnet 5.5 400s on a forced tool_choice
             messages=[{"role": "user", "content": content}],
+            **extra,
         )
         for block in response.content:
             if getattr(block, "type", None) == "tool_use":
